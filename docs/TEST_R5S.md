@@ -76,7 +76,7 @@
 sudo apt install build-essential bc bison flex libelf-dev git rsync \
     ethtool iproute2 iperf3 tcpdump pciutils sysstat trace-cmd \
     linux-perf bpftool xdp-tools libxdp-dev libbpf-dev clang llvm \
-    netcat-openbsd
+    netcat-openbsd python3
 # 内核头文件：Armbian 一般叫 linux-headers-<branch>-rockchip64，以 armbian-config 或 apt search 为准
 ls -d /lib/modules/$(uname -r)/build   # 这个目录必须存在
 ```
@@ -158,7 +158,7 @@ sh ~/r8125/tools/r5s-envcheck.sh | tee envcheck.txt
 |---|---|---|
 | **A. 环境就绪** | §1~§7 | 现在 |
 | **B. 官方原版基线** | 用 `vendor` 分支：<br>iperf3 双向单流 / 多流；<br>流量机 `xdp-trafficgen` 发 64B/512B/1518B，R5S 用 `ip -s link`、`mpstat` 记录收包 pps 和 CPU；<br>`xdp-bench drop|pass -m skb`（generic XDP）；<br>nft flowtable 转发 A→B；<br>R5S 上用 `pktgen` 做 TX 基线 | A |
-| **C. 第 0 步实验** | RX 对齐探测、短包自动填充探测（设计文档 §10.1 第 3、4 项）。我会写一个 `exp/phase0` 分支，用模块参数切换 offset 和是否填充，**不用每次重编** | A |
+| **C. 第 0 步实验** | RX 对齐探测、短包自动填充探测（设计文档 §10.1 第 4 项）。`exp/phase0` 分支用模块参数切换偏移和填充，**不用每次重编**；步骤见 [PHASE0.md](PHASE0.md) | A |
 | **D. 补丁回归** | 每个补丁合入后：B 的基线重跑一遍，再加上设计文档 §10.2 里对应的功能项 | B |
 | **E. 调试内核** | 自己编译的主线内核，开 DMA_API_DEBUG / KASAN / lockdep，长时间跑 XDP_TX、l2fwd 和拔插网线 | 补丁 7 之后 |
 | **F. 6.6 兼容** | 编一个 6.6 LTS 内核，覆盖兼容宏的另一个分支 | 补丁 9 之后 |
