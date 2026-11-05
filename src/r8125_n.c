@@ -325,6 +325,20 @@ static int enable_giga_lite = 1;
 static int enable_giga_lite = 0;
 #endif
 
+/*
+ * Phase 0 probes, see docs/PHASE0.md. Both knobs are read at module load
+ * and their defaults reproduce the vendor behaviour bit for bit.
+ */
+#define R8125_RX_OFFSET_MAX     512
+#define R8125_TX_PAD_SHORT      BIT(0)  /* pad frames shorter than ETH_ZLEN */
+#define R8125_TX_PAD_PTP        BIT(1)  /* 8125A/B PTP and short L4 erratum */
+#define R8125_TX_PAD_ALL        (R8125_TX_PAD_SHORT | R8125_TX_PAD_PTP)
+
+#ifdef ENABLE_PAGE_REUSE
+static uint rx_offset = R8125_RX_ALIGN;
+#endif
+static uint tx_pad = R8125_TX_PAD_ALL;
+
 MODULE_AUTHOR("Realtek and the Linux r8125 crew <netdev@vger.kernel.org>");
 MODULE_DESCRIPTION("Realtek r8125 Ethernet controller driver");
 
@@ -372,6 +386,14 @@ MODULE_PARM_DESC(enable_double_vlan, "Enable Double VLAN.");
 
 module_param(enable_giga_lite, int, 0);
 MODULE_PARM_DESC(enable_giga_lite, "Enable Giga Lite.");
+
+#ifdef ENABLE_PAGE_REUSE
+module_param(rx_offset, uint, 0444);
+MODULE_PARM_DESC(rx_offset, "Experiment: byte offset of each RX buffer inside its page half (0-512, default NET_IP_ALIGN).");
+#endif
+
+module_param(tx_pad, uint, 0444);
+MODULE_PARM_DESC(tx_pad, "Experiment: TX software padding, bit 0 short frames, bit 1 PTP erratum (default 3).");
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,0)
 module_param_named(debug, debug.msg_enable, int, 0);
@@ -18300,7 +18322,7 @@ rtl8125_remove_one(struct pci_dev *pdev)
 static inline unsigned int rtl8125_rx_page_order(unsigned rx_buf_sz, unsigned page_size)
 {
         unsigned truesize = SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) +
-                            SKB_DATA_ALIGN(rx_buf_sz + R8125_RX_ALIGN);
+                            SKB_DATA_ALIGN(rx_buf_sz + rx_offset);
 
         return get_order(truesize * 2);
 }
@@ -19626,7 +19648,7 @@ rtl8125_init_ring(struct net_device *dev)
         for (i = 0; i < tp->num_rx_rings; i++) {
                 struct rtl8125_rx_ring *ring = &tp->rx_ring[i];
 #ifdef ENABLE_PAGE_REUSE
-                ring->rx_offset = R8125_RX_ALIGN;
+                ring->rx_offset = rx_offset;
 #else
                 memset(ring->Rx_skbuff, 0x0, sizeof(ring->Rx_skbuff));
 #endif //ENABLE_PAGE_REUSE
@@ -20523,7 +20545,7 @@ rtl8125_tso_csum(struct sk_buff *skb,
                         check_patch_required = false;
         }
 
-        if (check_patch_required) {
+        if (check_patch_required && (tx_pad & R8125_TX_PAD_PTP)) {
                 u32 pad_len = rtl8125_get_patch_pad_len(tp, skb);
 
                 if (pad_len > 0) {
@@ -20538,7 +20560,8 @@ rtl8125_tso_csum(struct sk_buff *skb,
         if (skb->len < ETH_ZLEN) {
                 if (tp->UseSwPaddingShortPkt ||
                     (tp->ShortPacketSwChecksum && csum_cmd != 0)) {
-                        if (!rtl8125_skb_pad(skb))
+                        if ((tx_pad & R8125_TX_PAD_SHORT) &&
+                            !rtl8125_skb_pad(skb))
                                 return false;
 
                         if (csum_cmd != 0)
@@ -21339,8 +21362,8 @@ rtl8125_rx_interrupt(struct net_device *dev,
                         }
 
                         skb->dev = dev;
-                        if (!R8125_USE_NAPI_ALLOC_SKB)
-                                skb_reserve(skb, R8125_RX_ALIGN);
+                        /* build_skb() starts at the buffer, DMA lands rx_offset in */
+                        skb_reserve(skb, ring->rx_offset);
                         skb_put(skb, pkt_size);
 #ifdef ENABLE_RSS_SUPPORT
                         rtl8125_rx_hash(tp, desc, skb);
@@ -21981,9 +22004,41 @@ static struct pci_driver rtl8125_pci_driver = {
 };
 
 static int __init
+rtl8125_check_probe_params(void)
+{
+#ifdef ENABLE_PAGE_REUSE
+        if (rx_offset > R8125_RX_OFFSET_MAX) {
+                pr_err(PFX "rx_offset %u is above %u\n",
+                       rx_offset, R8125_RX_OFFSET_MAX);
+                return -EINVAL;
+        }
+        if (rx_offset != R8125_RX_ALIGN)
+                pr_warn(PFX "experiment: rx_offset %u, vendor default %d\n",
+                        rx_offset, R8125_RX_ALIGN);
+#endif
+        if (tx_pad & ~R8125_TX_PAD_ALL) {
+                pr_err(PFX "tx_pad %#x has bits outside %#lx\n",
+                       tx_pad, R8125_TX_PAD_ALL);
+                return -EINVAL;
+        }
+        if (tx_pad != R8125_TX_PAD_ALL)
+                pr_warn(PFX "experiment: tx_pad %#x, short frame padding %s, PTP erratum padding %s\n",
+                        tx_pad,
+                        tx_pad & R8125_TX_PAD_SHORT ? "on" : "off",
+                        tx_pad & R8125_TX_PAD_PTP ? "on" : "off");
+
+        return 0;
+}
+
+static int __init
 rtl8125_init_module(void)
 {
-        int ret = 0;
+        int ret;
+
+        ret = rtl8125_check_probe_params();
+        if (ret)
+                return ret;
+
 #ifdef ENABLE_R8125_PROCFS
         rtl8125_proc_module_init();
 #endif
