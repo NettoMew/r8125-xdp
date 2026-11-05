@@ -1,0 +1,18 @@
+# Local tool state
+.omx/
+
+# Upstream reference sources (GPL-2.0, read-only, ~8.5MB); see docs/AF_XDP_ZC_DESIGN.md §12
+docs/refs/
+
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+*.a
+Module.symvers
+modules.order
+.tmp_versions/
+.cache.mk
