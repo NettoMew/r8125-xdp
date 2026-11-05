@@ -515,7 +515,7 @@ def peer_counters(iface):
     except (ProbeError, OSError):
         pass
     stats = Path("/sys/class/net", iface, "statistics")
-    for key in IF_COUNTERS:
+    for key in RX_ERRORS:
         values[f"sysfs.{key}"] = int(read(stats / key, "0"))
     return values
 
