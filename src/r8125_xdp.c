@@ -23,6 +23,9 @@
 #include "r8125.h"
 #include "r8125_xdp.h"
 
+#define RTL8125_XSK_DMA_ATTRS   (DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING)
+#define RTL8125_XSK_FILL_BATCH  32
+
 /* The erratum padding of rtl8125_get_patch_pad_len(), MIN_PATCH_LEN there */
 #define PTP_PAD_L4_LEN          47
 #define PTP_PAD_MAX_FRAME       (128 + PTP_PAD_L4_LEN)
@@ -148,10 +151,23 @@ static bool rtl8125_xdp_fits(unsigned int mtu)
                SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) <= PAGE_SIZE;
 }
 
+/* A zero-copy ring hands the hardware chunks of the pool's frame size */
+static bool rtl8125_xsk_fits(struct xsk_buff_pool *pool, unsigned int mtu)
+{
+        return xsk_pool_get_rx_frame_size(pool) >= rtl8125_mtu_to_rms(mtu);
+}
+
 int rtl8125_xdp_check_mtu(struct rtl8125_private *tp, int mtu)
 {
+        int i;
+
         if (tp->xdp_prog && !rtl8125_xdp_fits(mtu))
                 return -EINVAL;
+
+        for (i = 0; i < tp->num_rx_rings; i++)
+                if (tp->rx_ring[i].xsk_pool &&
+                    !rtl8125_xsk_fits(tp->rx_ring[i].xsk_pool, mtu))
+                        return -EINVAL;
 
         return 0;
 }
@@ -192,11 +208,81 @@ static int rtl8125_xdp_setup_prog(struct net_device *dev, struct bpf_prog *prog,
         return 0;
 }
 
+struct rtl8125_xsk_binding {
+        struct xsk_buff_pool *pool;
+        u16 qid;
+};
+
+static void rtl8125_xsk_set_pool(struct rtl8125_private *tp, void *arg)
+{
+        const struct rtl8125_xsk_binding *b = arg;
+
+        tp->rx_ring[b->qid].xsk_pool = b->pool;
+}
+
+/*
+ * Bind or unbind an XSK pool. Without a program the pool is only recorded,
+ * and becomes live at the next ring rebuild that finds both. Unbinding must
+ * not fail: the core has already decided.
+ */
+static int rtl8125_xsk_pool_setup(struct net_device *dev,
+                                  struct xsk_buff_pool *pool, u16 qid)
+{
+        struct rtl8125_private *tp = netdev_priv(dev);
+        struct rtl8125_xsk_binding b = { .pool = pool, .qid = qid };
+        bool live = netif_running(dev) && tp->xdp_prog;
+        int err;
+
+        if (qid >= tp->num_rx_rings || qid >= tp->num_tx_rings)
+                return -EINVAL;
+
+        if (!pool) {
+                pool = tp->rx_ring[qid].xsk_pool;
+                if (!pool)
+                        return -EINVAL;
+
+                if (live)
+                        rtl8125_rings_rebuild(dev, rtl8125_xsk_set_pool, &b);
+                else
+                        rtl8125_xsk_set_pool(tp, &b);
+
+                xsk_pool_dma_unmap(pool, RTL8125_XSK_DMA_ATTRS);
+                return 0;
+        }
+
+        if (!rtl8125_xsk_fits(pool, dev->mtu))
+                return -EINVAL;
+
+        err = xsk_pool_dma_map(pool, &tp->pci_dev->dev, RTL8125_XSK_DMA_ATTRS);
+        if (err)
+                return err;
+
+        if (!live) {
+                rtl8125_xsk_set_pool(tp, &b);
+                return 0;
+        }
+
+        err = rtl8125_rings_rebuild(dev, rtl8125_xsk_set_pool, &b);
+        if (err) {
+                b.pool = NULL;
+                rtl8125_rings_rebuild(dev, rtl8125_xsk_set_pool, &b);
+                xsk_pool_dma_unmap(pool, RTL8125_XSK_DMA_ATTRS);
+                return err;
+        }
+
+        /* Start receiving without waiting for an interrupt */
+        rtl8125_xsk_wakeup(dev, qid, XDP_WAKEUP_RX);
+
+        return 0;
+}
+
 int rtl8125_xdp_bpf(struct net_device *dev, struct netdev_bpf *bpf)
 {
         switch (bpf->command) {
         case XDP_SETUP_PROG:
                 return rtl8125_xdp_setup_prog(dev, bpf->prog, bpf->extack);
+        case XDP_SETUP_XSK_POOL:
+                return rtl8125_xsk_pool_setup(dev, bpf->xsk.pool, bpf->xsk.queue_id);
         default:
                 return -EOPNOTSUPP;
         }
@@ -500,6 +586,175 @@ bool rtl8125_xdp_rx(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring,
                 rtl8125_recycle_rx_buffer(tp, ring, rxb);
                 return true;
         }
+}
+
+/*
+ * Pick the buffer source of a ring as init_ring refills it: an XSK pool
+ * when one is bound and a program runs, pages otherwise. Registering a
+ * memory model without an allocator cannot fail on a registered queue.
+ */
+void rtl8125_xdp_ring_setup(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring)
+{
+        ring->zc = ring->xsk_pool && tp->xdp_prog;
+
+        xdp_rxq_info_unreg_mem_model(&ring->xdp_rxq);
+        if (ring->zc) {
+                xdp_rxq_info_reg_mem_model(&ring->xdp_rxq, MEM_TYPE_XSK_BUFF_POOL, NULL);
+                xsk_pool_set_rxq_info(ring->xsk_pool, &ring->xdp_rxq);
+        } else {
+                xdp_rxq_info_reg_mem_model(&ring->xdp_rxq, MEM_TYPE_PAGE_SHARED, NULL);
+        }
+}
+
+/*
+ * Arm the empty slots from start to end with pool buffers, as far as the
+ * fill queue allows, and return how many were armed. With need_wakeup the
+ * application learns that it has to refill and kick.
+ */
+u32 rtl8125_xsk_rx_fill(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring,
+                        u32 start, u32 end)
+{
+        struct xsk_buff_pool *pool = ring->xsk_pool;
+        u32 cur = start;
+
+        while (end - cur > 0) {
+                struct xdp_buff *bufs[RTL8125_XSK_FILL_BATCH];
+                u32 i, n;
+
+                n = xsk_buff_alloc_batch(pool, bufs,
+                                         min_t(u32, end - cur, RTL8125_XSK_FILL_BATCH));
+                if (!n)
+                        break;
+
+                for (i = 0; i < n; i++, cur++) {
+                        u32 entry = cur % ring->num_rx_desc;
+
+                        ring->rx_buffer[entry].xdp = bufs[i];
+                        rtl8125_rx_arm(tp, ring, entry, xsk_buff_xdp_get_dma(bufs[i]));
+                }
+        }
+
+        if (xsk_uses_need_wakeup(pool)) {
+                if (cur != end)
+                        xsk_set_rx_need_wakeup(pool);
+                else
+                        xsk_clear_rx_need_wakeup(pool);
+        }
+
+        return cur - start;
+}
+
+/* Return every buffer to the pool; NAPI is stopped */
+void rtl8125_xsk_rx_clear(struct rtl8125_rx_ring *ring)
+{
+        int i;
+
+        for (i = 0; i < ring->num_rx_desc; i++)
+                if (ring->rx_buffer[i].xdp)
+                        rtl8125_xsk_rx_free(&ring->rx_buffer[i]);
+}
+
+/* XDP_PASS on a zero-copy ring: the stack gets a copy, the pool its buffer */
+static struct sk_buff *rtl8125_xsk_construct_skb(struct rtl8125_private *tp,
+                                                 struct rtl8125_rx_ring *ring,
+                                                 struct xdp_buff *xdp)
+{
+        unsigned int metasize = xdp->data - xdp->data_meta;
+        unsigned int len = xdp->data_end - xdp->data_meta;
+        struct sk_buff *skb;
+
+        skb = napi_alloc_skb(rtl8125_q_napi(tp, ring->index, false), len);
+        if (unlikely(!skb))
+                return NULL;
+
+        memcpy(__skb_put(skb, len), xdp->data_meta, len);
+        if (metasize) {
+                __skb_pull(skb, metasize);
+                skb_metadata_set(skb, metasize);
+        }
+
+        return skb;
+}
+
+/*
+ * Run the program on a frame in a zero-copy buffer. Returns the skb for
+ * XDP_PASS, NULL once the buffer has been dealt with. The slot is left
+ * empty either way and refilled from the pool at the end of the poll.
+ */
+struct sk_buff *rtl8125_xsk_rx(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring,
+                               struct rtl8125_rx_buffer *rxb, u32 len, u32 *status)
+{
+        struct bpf_prog *prog = READ_ONCE(tp->xdp_prog);
+        struct xdp_buff *xdp = rxb->xdp;
+        struct net_device *dev = tp->dev;
+        struct sk_buff *skb;
+        u32 act;
+
+        rxb->xdp = NULL;
+        xsk_buff_set_size(xdp, len);
+        rtl8125_xsk_sync_for_cpu(xdp, ring->xsk_pool);
+
+        act = bpf_prog_run_xdp(prog, xdp);
+        switch (act) {
+        case XDP_REDIRECT:
+                if (likely(!xdp_do_redirect(dev, xdp, prog))) {
+                        *status |= RTL8125_XDP_REDIR;
+                        return NULL;
+                }
+                trace_xdp_exception(dev, prog, act);
+                break;
+        case XDP_TX:
+                /* Copied into a page of its own, the buffer is already back */
+                if (likely(rtl8125_xdp_tx_back(tp, xdp)))
+                        *status |= RTL8125_XDP_TX;
+                else
+                        trace_xdp_exception(dev, prog, act);
+                return NULL;
+        case XDP_PASS:
+                skb = rtl8125_xsk_construct_skb(tp, ring, xdp);
+                xsk_buff_free(xdp);
+                return skb;
+        default:
+                bpf_warn_invalid_xdp_action(dev, prog, act);
+                fallthrough;
+        case XDP_ABORTED:
+                trace_xdp_exception(dev, prog, act);
+                fallthrough;
+        case XDP_DROP:
+                break;
+        }
+
+        xsk_buff_free(xdp);
+        return NULL;
+}
+
+static void rtl8125_napi_kick(struct napi_struct *napi)
+{
+        if (napi_if_scheduled_mark_missed(napi))
+                return;
+
+        local_bh_disable();
+        napi_schedule(napi);
+        local_bh_enable();
+}
+
+int rtl8125_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags)
+{
+        struct rtl8125_private *tp = netdev_priv(dev);
+
+        if (!netif_running(dev) || !netif_carrier_ok(dev))
+                return -ENETDOWN;
+
+        if (qid >= tp->num_rx_rings || qid >= tp->num_tx_rings ||
+            !READ_ONCE(tp->rx_ring[qid].zc))
+                return -EINVAL;
+
+        if (flags & XDP_WAKEUP_RX)
+                rtl8125_napi_kick(rtl8125_q_napi(tp, qid, false));
+        if (flags & XDP_WAKEUP_TX)
+                rtl8125_napi_kick(rtl8125_q_napi(tp, qid, true));
+
+        return 0;
 }
 
 void rtl8125_xdp_finalize(struct rtl8125_private *tp, u32 status)

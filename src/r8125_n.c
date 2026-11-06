@@ -17758,6 +17758,7 @@ static const struct net_device_ops rtl8125_netdev_ops = {
 #ifdef ENABLE_XDP_SUPPORT
         .ndo_bpf            = rtl8125_xdp_bpf,
         .ndo_xdp_xmit       = rtl8125_xdp_xmit,
+        .ndo_xsk_wakeup     = rtl8125_xsk_wakeup,
 #endif
 };
 #endif
@@ -19377,6 +19378,18 @@ rtl8125_map_to_asic(struct rtl8125_private *tp,
         rtl8125_mark_to_asic(tp, desc, rx_buf_sz);
 }
 
+/* Give the hardware a buffer at dma for RX descriptor entry */
+void
+rtl8125_rx_arm(struct rtl8125_private *tp,
+               struct rtl8125_rx_ring *ring,
+               u32 entry,
+               dma_addr_t dma)
+{
+        rtl8125_map_to_asic(tp, ring,
+                            rtl8125_get_rxdesc(tp, ring->RxDescArray, entry),
+                            dma, tp->rx_buf_sz, entry);
+}
+
 #ifdef ENABLE_PAGE_REUSE
 
 static int
@@ -19433,6 +19446,11 @@ _rtl8125_rx_clear(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring)
         int i;
         struct rtl8125_rx_buffer *rxb;
 
+        if (rtl8125_ring_is_zc(ring)) {
+                rtl8125_xsk_rx_clear(ring);
+                return;
+        }
+
         for (i = 0; i < ring->num_rx_desc; i++) {
                 rxb = &ring->rx_buffer[i];
                 if (rxb->skb) {
@@ -19453,6 +19471,9 @@ rtl8125_rx_fill(struct rtl8125_private *tp,
 {
         u32 cur;
         struct rtl8125_rx_buffer *rxb;
+
+        if (rtl8125_ring_is_zc(ring))
+                return rtl8125_xsk_rx_fill(tp, ring, start, end);
 
         for (cur = start; end - cur > 0; cur++) {
                 int ret, i = cur % ring->num_rx_desc;
@@ -19699,13 +19720,22 @@ rtl8125_init_ring(struct net_device *dev)
 
         for (i = 0; i < tp->num_rx_rings; i++) {
                 struct rtl8125_rx_ring *ring = &tp->rx_ring[i];
+                u32 filled;
+
 #ifdef ENABLE_PAGE_REUSE
                 ring->rx_offset = tp->rx_headroom;
 #else
                 memset(ring->Rx_skbuff, 0x0, sizeof(ring->Rx_skbuff));
 #endif //ENABLE_PAGE_REUSE
-                if (rtl8125_rx_fill(tp, ring, dev, 0, ring->num_rx_desc, 0) != ring->num_rx_desc)
-                        goto err_out;
+                rtl8125_xdp_ring_setup(tp, ring);
+
+                filled = rtl8125_rx_fill(tp, ring, dev, 0, ring->num_rx_desc, 0);
+                if (filled != ring->num_rx_desc) {
+                        if (!rtl8125_ring_is_zc(ring))
+                                goto err_out;
+                        /* A zero-copy ring takes what its pool has and catches up in the poll */
+                        ring->dirty_rx -= ring->num_rx_desc - filled;
+                }
 
                 rtl8125_mark_as_last_descriptor(tp, rtl8125_get_rxdesc(tp, ring->RxDescArray, ring->num_rx_desc - 1));
         }
@@ -21292,6 +21322,12 @@ void rtl8125_recycle_rx_buffer(struct rtl8125_private *tp,
         u32 entry = ring->dirty_rx % ring->num_rx_desc;
         struct rtl8125_rx_buffer *nrxb = &ring->rx_buffer[entry];
 
+        /* A zero-copy buffer goes back to its pool; the poll refills the slot */
+        if (rtl8125_ring_is_zc(ring)) {
+                rtl8125_xsk_rx_free(rxb);
+                return;
+        }
+
         if (nrxb != rxb) {
                 nrxb->page = rxb->page;
                 nrxb->page_offset = rxb->page_offset;
@@ -21433,6 +21469,20 @@ rtl8125_rx_interrupt(struct net_device *dev,
 
 #ifdef ENABLE_PAGE_REUSE
                 rxb = &ring->rx_buffer[entry];
+                if (rtl8125_ring_is_zc(ring)) {
+                        skb = rtl8125_xsk_rx(tp, ring, rxb, pkt_size, &xdp_status);
+                        if (!skb) {
+                                total_rx_packets++;
+                                total_rx_bytes += pkt_size;
+                                continue;
+                        }
+#ifdef ENABLE_RSS_SUPPORT
+                        rtl8125_rx_hash(tp, desc, skb);
+#endif
+                        rtl8125_rx_csum(tp, skb, desc);
+                        goto rx_skb_ready;
+                }
+
                 /* Only the bytes the hardware wrote have to reach the CPU */
                 dma_sync_single_range_for_cpu(tp_to_dev(tp),
                                               rxb->dma,
@@ -21474,6 +21524,7 @@ rtl8125_rx_interrupt(struct net_device *dev,
 
                 //recycle desc
                 rtl8125_put_rx_buffer(tp, ring, cur_rx, rxb);
+rx_skb_ready:
 
 #else //ENABLE_PAGE_REUSE
                 skb = RTL_ALLOC_SKB_INTR(&tp->r8125napi[ring->index].napi, pkt_size + R8125_RX_ALIGN);
@@ -21587,6 +21638,10 @@ drop_packet:
          */
         if ((ring->dirty_rx + ring->num_rx_desc == ring->cur_rx) && netif_msg_intr(tp))
                 printk(KERN_EMERG "%s: Rx buffers exhausted\n", dev->name);
+
+        /* Without need_wakeup nobody else tells the driver to retry */
+        if (rtl8125_xsk_rx_starved(ring))
+                return rx_quota;
 
 rx_out:
         return total_rx_packets;

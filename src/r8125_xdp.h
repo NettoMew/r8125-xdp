@@ -31,9 +31,18 @@ struct rtl8125_rx_frame {
 #error "ENABLE_XDP_SUPPORT needs ENABLE_PAGE_REUSE, without ENABLE_RX_PACKET_FRAGMENT or ENABLE_LIB_SUPPORT"
 #endif
 
+#include <net/xdp_sock_drv.h>
+
 /* What an RX poll left for rtl8125_xdp_finalize() */
 #define RTL8125_XDP_REDIR       BIT(0)
 #define RTL8125_XDP_TX          BIT(1)
+
+/* Linux 6.10 dropped the pool argument */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,10,0)
+#define rtl8125_xsk_sync_for_cpu(xdp, pool)     xsk_buff_dma_sync_for_cpu(xdp, pool)
+#else
+#define rtl8125_xsk_sync_for_cpu(xdp, pool)     xsk_buff_dma_sync_for_cpu(xdp)
+#endif
 
 struct napi_struct *rtl8125_q_napi(struct rtl8125_private *tp, u32 q, bool tx);
 
@@ -54,6 +63,36 @@ void rtl8125_xdp_finalize(struct rtl8125_private *tp, u32 status);
 
 int rtl8125_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
                      u32 flags);
+
+void rtl8125_xdp_ring_setup(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring);
+u32 rtl8125_xsk_rx_fill(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring,
+                        u32 start, u32 end);
+void rtl8125_xsk_rx_clear(struct rtl8125_rx_ring *ring);
+struct sk_buff *rtl8125_xsk_rx(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring,
+                               struct rtl8125_rx_buffer *rxb, u32 len, u32 *status);
+int rtl8125_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags);
+
+/* Whether a ring runs on AF_XDP buffers; fixed while NAPI runs */
+static inline bool rtl8125_ring_is_zc(const struct rtl8125_rx_ring *ring)
+{
+        return ring->zc;
+}
+
+static inline void rtl8125_xsk_rx_free(struct rtl8125_rx_buffer *rxb)
+{
+        xsk_buff_free(rxb->xdp);
+        rxb->xdp = NULL;
+}
+
+/*
+ * A zero-copy ring whose last refill came up short. Without need_wakeup
+ * the application will not kick, so NAPI keeps polling until it can refill.
+ */
+static inline bool rtl8125_xsk_rx_starved(const struct rtl8125_rx_ring *ring)
+{
+        return ring->zc && ring->dirty_rx != ring->cur_rx &&
+               !xsk_uses_need_wakeup(ring->xsk_pool);
+}
 
 /* Release what a non-skb TX descriptor completes */
 static inline void rtl8125_xdp_tx_release(struct ring_info *ri,
@@ -107,7 +146,6 @@ static inline int rtl8125_xdp_check_mtu(struct rtl8125_private *tp, int mtu)
         return 0;
 }
 
-#ifdef ENABLE_PAGE_REUSE
 static inline bool rtl8125_xdp_rx(struct rtl8125_private *tp,
                                   struct rtl8125_rx_ring *ring,
                                   u32 cur_rx, struct rtl8125_rx_buffer *rxb,
@@ -115,7 +153,37 @@ static inline bool rtl8125_xdp_rx(struct rtl8125_private *tp,
 {
         return false;
 }
-#endif
+
+static inline void rtl8125_xdp_ring_setup(struct rtl8125_private *tp,
+                                          struct rtl8125_rx_ring *ring) {}
+
+static inline bool rtl8125_ring_is_zc(const struct rtl8125_rx_ring *ring)
+{
+        return false;
+}
+
+static inline u32 rtl8125_xsk_rx_fill(struct rtl8125_private *tp,
+                                      struct rtl8125_rx_ring *ring,
+                                      u32 start, u32 end)
+{
+        return 0;
+}
+
+static inline void rtl8125_xsk_rx_clear(struct rtl8125_rx_ring *ring) {}
+static inline void rtl8125_xsk_rx_free(struct rtl8125_rx_buffer *rxb) {}
+
+static inline bool rtl8125_xsk_rx_starved(const struct rtl8125_rx_ring *ring)
+{
+        return false;
+}
+
+static inline struct sk_buff *rtl8125_xsk_rx(struct rtl8125_private *tp,
+                                             struct rtl8125_rx_ring *ring,
+                                             struct rtl8125_rx_buffer *rxb,
+                                             u32 len, u32 *status)
+{
+        return NULL;
+}
 
 static inline void rtl8125_xdp_finalize(struct rtl8125_private *tp, u32 status) {}
 

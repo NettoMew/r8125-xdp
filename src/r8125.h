@@ -2227,7 +2227,12 @@ struct rtl8125_tx_ring {
 };
 
 struct rtl8125_rx_buffer {
-        struct page *page;
+        union {
+                struct page *page;
+#ifdef ENABLE_XDP_SUPPORT
+                struct xdp_buff *xdp;   /* on a zero-copy ring */
+#endif //ENABLE_XDP_SUPPORT
+        };
         u32 page_offset;
         dma_addr_t dma;
         void* data;
@@ -2256,6 +2261,8 @@ struct rtl8125_rx_ring {
 
 #ifdef ENABLE_XDP_SUPPORT
         struct xdp_rxq_info xdp_rxq;
+        struct xsk_buff_pool *xsk_pool; /* bound by AF_XDP, used once a program runs */
+        bool zc;                        /* buffers come from xsk_pool, set by init_ring */
 #endif //ENABLE_XDP_SUPPORT
 };
 
@@ -3050,6 +3057,8 @@ void rtl8125_tx_clear(struct rtl8125_private *tp);
 void rtl8125_rx_clear(struct rtl8125_private *tp);
 int rtl8125_init_ring(struct net_device *dev);
 unsigned int rtl8125_mtu_to_rms(unsigned int mtu);
+void rtl8125_rx_arm(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring,
+                    u32 entry, dma_addr_t dma);
 bool rtl8125_require_pad_ptp_pkt(struct rtl8125_private *tp);
 bool rtl8125_tx_slots_avail(struct rtl8125_private *tp,
                             struct rtl8125_tx_ring *ring);
