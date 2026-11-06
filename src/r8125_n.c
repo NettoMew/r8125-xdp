@@ -21403,6 +21403,14 @@ rtl8125_rx_interrupt(struct net_device *dev,
 
 #ifdef ENABLE_PAGE_REUSE
                 rxb = &ring->rx_buffer[entry];
+                /* Only the bytes the hardware wrote have to reach the CPU */
+                dma_sync_single_range_for_cpu(tp_to_dev(tp),
+                                              rxb->dma,
+                                              rxb->page_offset,
+                                              pkt_size,
+                                              DMA_FROM_DEVICE);
+                prefetch(rxb->data + rxb->page_offset);
+
                 skb = rxb->skb;
                 rxb->skb = NULL;
                 if (!skb) {
@@ -21423,12 +21431,6 @@ rtl8125_rx_interrupt(struct net_device *dev,
                 } else
                         skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, rxb->page,
                                         rxb->page_offset, pkt_size, tp->rx_buf_page_size / 2);
-
-                dma_sync_single_range_for_cpu(tp_to_dev(tp),
-                                              rxb->dma,
-                                              rxb->page_offset,
-                                              tp->rx_buf_sz,
-                                              DMA_FROM_DEVICE);
 
                 //recycle desc
                 rtl8125_put_rx_buffer(tp, ring, cur_rx, rxb);
