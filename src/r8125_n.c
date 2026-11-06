@@ -21339,8 +21339,8 @@ rtl8125_rx_interrupt(struct net_device *dev,
                         }
 
                         skb->dev = dev;
-                        if (!R8125_USE_NAPI_ALLOC_SKB)
-                                skb_reserve(skb, R8125_RX_ALIGN);
+                        /* build_skb() starts at the buffer, DMA lands rx_offset in */
+                        skb_reserve(skb, ring->rx_offset);
                         skb_put(skb, pkt_size);
 #ifdef ENABLE_RSS_SUPPORT
                         rtl8125_rx_hash(tp, desc, skb);
