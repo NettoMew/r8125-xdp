@@ -7,7 +7,7 @@
 | 内核范围 | **6.6 ~ 7.x**（已对 v6.6 / 6.8 / 6.9 / 6.10 / 6.12 / 6.13 / 6.14 / 6.18 / 7.3 头文件逐一核对） |
 | 已定决策 | ① 支持到 6.6 LTS；② 官方驱动隐患 A / B / C 全部修复 |
 | 主要场景 | 软路由（RTL8125 x86 小主机；NanoPi R5S / R5C、Radxa E52C 等 Rockchip arm64 板） |
-| 文档状态 | 第 0 步实测已完成（2026-11-06，Cubie A7Z + RTL8125B，结果见 §10.1）；补丁 1~4 已提交并上机验证 |
+| 文档状态 | **已实现**（2026-11-07）：补丁序列全部提交并在 Cubie A7Z（RTL8125B）上验证，用法与实测见 [XDP.md](XDP.md)。正文保留设计推导；实现时的改动在各节以“实现”标出，汇总见 §9 |
 
 > **范围说明（2026-11 调研后补充）：** 对软路由来说，真正有用的终点是**补丁 8**（原生 XDP + `ndo_xdp_xmit`，配合 xdp-tools 的 `xdp-forward`）。补丁 9~10 的零拷贝只服务于 AF_XDP 用户态程序，包括 DPDK `net/af_xdp`，列为可选。DPDK 原生 `net/r8169` 在 Rockchip 平台上不可用（§2.4），因此 DPDK 在这些板子上唯一可行的路径就是"本方案 + `net/af_xdp`"。
 
@@ -33,7 +33,7 @@
 ## 1. 结论
 
 - **可行。** 驱动当前完全没有 XDP 支持（没有 `ndo_bpf`、`xdp_rxq_info`、page_pool），所以分两层做：先做原生 XDP，再在它之上做 XSK 零拷贝。
-- **对官方代码的改动很小。** 新逻辑全部放在 `r8125_xdp.c` / `r8125_xdp.h`，由 `ENABLE_XDP_SUPPORT` 开关控制。`r8125_n.c` 只增加约 15 处单行调用点，外加 3 个隐患修复和 2 个只重构不改行为的补丁。
+- **对官方代码的改动很小。** 新逻辑全部放在 `r8125_xdp.c` / `r8125_xdp.h`，由 `ENABLE_XDP_SUPPORT` 开关控制。`r8125_n.c` 只增加约 17 处单行调用点（§5.3），外加 4 个隐患修复（实现时多发现了隐患 D）和 3 个只重构不改行为的补丁。
 - **没有上游先例。** 上游 r8169 至今没有 XDP（v7.3 中搜 xdp/xsk 都是 0 处），2021 年的社区补丁也没被接收。也没找到任何 r8125 的 AF_XDP 实现。
 - **性能预期。** 2.5G 小包线速约 3.72 Mpps（2.5e9 ÷ (84 × 8)）。零拷贝主要降低 CPU 占用和延迟抖动，不太可能让吞吐翻倍。做到第 4 个补丁（原生 XDP + copy 模式 AF_XDP）时先实测，再决定是否继续投入零拷贝。
 
@@ -160,6 +160,13 @@ static void rtl8125_reset_rings(struct net_device *dev)
 
 - **对 XDP 的意义：** 这是 ZC 正确性的基础。修复后，link 抖动时 ZC 环可以放心地把 buffer 全部还给 pool 再取回（§2.3 最后一行），不需要专门的"保留 buffer"逻辑。
 
+### 隐患 D：页复用模式下，丢弃的帧会让下一个正常帧覆盖一个仍在使用的缓冲区（实现时发现，已上机复现）
+
+- **位置：** `rtl8125_rx_interrupt` 的 `release_descriptor` 路径，配合 `rtl8125_put_rx_buffer`。
+- **原因：** 页复用的环有一个不变量：`dirty_rx` 到 `cur_rx` 之间的槽位都是空的。`put_rx_buffer` 依赖它，直接把另一半页交给 `dirty_rx` 处的槽位，不检查那里有没有 buffer。丢包路径（描述符错误、超长帧、skb 分配失败）却把描述符原地交还硬件，`cur_rx` 前进而 `dirty_rx` 不动。下一个正常帧于是覆盖了那个槽位上仍然映射着、交给了硬件的页：页和 DMA 映射泄漏，描述符在硬件持有时被改写。
+- **复现：** 让每隔一个描述符走一次丢包路径，修复前每 1 万次丢包空闲页减少约 5000 页，修复后不变。
+- **修复：** 丢包改走新的 `rtl8125_recycle_rx_buffer()`，把同一个 buffer 原样交给 `dirty_rx` 处的槽位，和正常路径一样维持不变量。XDP_DROP 也走它。
+
 ---
 
 ## 4. 内核兼容策略（6.6+）
@@ -249,23 +256,25 @@ rtl8125_xdp_init/exit()        填充 buffer 的分配和释放、xdp_features
 
 ### 5.3 `r8125_n.c` 调用点清单
 
-| # | 位置 | 改动 |
+| # | 位置 | 改动（实现后的形态） |
 |---|---|---|
-| H1 | `net_device_ops`（`:17712`） | `.ndo_bpf`、`.ndo_xdp_xmit`、`.ndo_xsk_wakeup`（唯一的 `#ifdef`） |
-| H2 | `rtl8125_rx_interrupt` 开头 | `if (rtl8125_ring_is_zc(ring)) return rtl8125_rx_zc(dev, tp, ring, budget);` |
-| H3 | 页复用分支，sync 之后、`build_skb` 之前 | `act = rtl8125_run_xdp(tp, ring, rxb, desc, pkt_size, &xdp);` 分发到 §7.2 的三条路径 |
-| H4 | `rtl8125_rx_interrupt` 结尾 | `rtl8125_xdp_finalize(tp, xdp_status);` |
-| H5 | `rtl8125_init_ring` 每个环的循环里 | ZC 环调用 `rtl8125_xsk_ring_fill`，否则走原有 `rtl8125_rx_fill`；然后 `rtl8125_xdp_ring_setup(tp, ring)` |
-| H6 | `_rtl8125_rx_clear` | ZC 环调用 `rtl8125_xsk_ring_clear` |
-| H7 | `init_ring` 里 `ring->rx_offset = R8125_RX_ALIGN`（`:19631`） | 改为 `ring->rx_offset = tp->rx_headroom` |
-| H8 | `rtl8125_set_rxbufsize` | `tp->rx_headroom = rtl8125_xdp_headroom(tp)`；`rx_page_order` 把 headroom 也算进去 |
-| H9 | `rtl8125_rx_page_order` | 参数从 `R8125_RX_ALIGN` 改为 `headroom` |
-| H10 | TX 完成两个循环 + `tx_clear_range` | 合并成 `rtl8125_tx_release()`（§7.4） |
-| H11 | `rtl8125_tx_interrupt` 包装函数（`:20889`） | 清理完之后 `count += rtl8125_xsk_tx(ring, budget);`，所有 ISR 版本都经过这里，只需一处 |
-| H12 | `rtl8125_change_mtu` | 函数体换成 `rtl8125_rings_rebuild()`，前面加 `rtl8125_xdp_check_mtu()` |
-| H13 | open / close | `rtl8125_xdp_rxq_reg/unreg(tp)` |
-| H14 | probe / remove | `rtl8125_xdp_init/exit(tp)`：填充 buffer 和 `xdp_features` |
-| H15 | 隐患 A / B / C 的修复点 | 见 §3 |
+| H1 | `net_device_ops` | `.ndo_bpf`、`.ndo_xdp_xmit`、`.ndo_xsk_wakeup`（唯一的 `#ifdef`） |
+| H2 | 页复用分支开头 | ZC 环：`skb = rtl8125_xsk_rx(...)`；返回 NULL 计数后 `continue`，否则做完 RSS hash / 校验和后 `goto rx_skb_ready` 汇入官方后半段。**不另写收包循环**（§7.3） |
+| H3 | 页复用分支，sync 之后、`build_skb` 之前 | `if (rtl8125_xdp_rx(tp, ring, cur_rx, rxb, &frame, &xdp_status)) { 计数; continue; }`；PASS 时 `skb_reserve(frame.offset)`、`skb_put(frame.len)`、`rtl8125_xdp_skb_meta()` |
+| H4 | 收包循环结束后 | `rtl8125_xdp_finalize(tp, xdp_status);` |
+| H5 | `rtl8125_init_ring` | 填充前 `rtl8125_xdp_ring_setup(tp, ring)`；ZC 环允许只填一部分，差额记进 `dirty_rx` |
+| H6 | `_rtl8125_rx_clear`、`rtl8125_rx_fill`、`rtl8125_recycle_rx_buffer` 开头 | ZC 环分别转到 `rtl8125_xsk_rx_clear` / `rtl8125_xsk_rx_fill` / `rtl8125_xsk_rx_free` |
+| H7 | `init_ring` | `ring->rx_offset = tp->rx_headroom` |
+| H8 | `rtl8125_set_rxbufsize` | `tp->rx_headroom = rtl8125_xdp_headroom(tp)`；`tp->rms = rtl8125_mtu_to_rms(mtu)` |
+| H9 | `rtl8125_rx_page_order` | 参数从 `page_size`（没用到）改为 `headroom` |
+| H10 | TX 完成两个循环 + `tx_clear_range` | 合并成 `rtl8125_tx_release()`；非 skb 类型交给 `rtl8125_xdp_tx_release()`；循环后 `rtl8125_xdp_tx_done()` |
+| H11 | `rtl8125_tx_interrupt` 包装函数 | 清理完之后 `rtl8125_xsk_xmit(ring)`，所有 ISR 版本只需这一处 |
+| H12 | `rtl8125_change_mtu` | 函数体换成 `rtl8125_rings_rebuild()`，前面 `rtl8125_xdp_check_mtu()` |
+| H13 | `rtl8125_alloc_rx_desc` / `rtl8125_free_rx_desc` | `rtl8125_xdp_rxq_reg/unreg`，和描述符环同生共死（open 出错路径也就自动对称） |
+| H14 | probe / remove | `rtl8125_xdp_init/exit(tp)`：8125A/B 的零填充 buffer 和 `xdp_features` |
+| H15 | 隐患 A / B / C / D 的修复点 | 见 §3 |
+| H16 | `rtl8125_enable_napi` | `rtl8125_xdp_napi_enabled(tp)`：登记队列到 NAPI 的映射（§7.8） |
+| H17 | 收包函数返回前 | ZC 环不开 need_wakeup 又没补满时返回 budget，让 NAPI 继续轮询 |
 
 ---
 
@@ -402,34 +411,33 @@ xdp_prepare_buff(&xdp, hard_start, ring->rx_offset, pkt_size, false);
 | `PASS` | 原有 `build_skb` 流程，reserve 用 `xdp.data - hard_start`、len 用 `xdp.data_end - xdp.data`（顺带覆盖了隐患 A） | 原样 |
 | `TX` / `REDIRECT` | `rtl8125_put_rx_buffer()`：翻转到另一半页，引用计数 +1。效果等同于 PASS 时 skb 持有一个引用 | 帧持有一个引用 |
 
+- **实现：先翻转，再交出。** TX / REDIRECT 必须在交出帧**之前**调用 `rtl8125_put_rx_buffer()`（和官方 PASS 路径一致）：redirect 到拷贝模式的 XSK 时，内核会在 `xdp_do_redirect()` 返回之前就释放帧的页引用；如果先交出再加引用，这一页会在仍处于映射、仍在环里时被释放。交出失败时由驱动把这个引用还回去。
+- **实现：DROP 走 `rtl8125_recycle_rx_buffer()`**，不再"原地交还"（§3 隐患 D）。
 - **XDP_TX 必须重新映射。** 用 `dma_map_single(xdpf->data, TO_DEVICE)` 新建映射（igb 也是这样），**不能**复用 RX 的映射：官方在复用失败时会 `dma_unmap_page`，而 TX 可能还在读这块内存。
 - **页的释放。** `dev_alloc_pages` 带 `__GFP_COMP`，所以 `xdp_return_frame` 内部的 `page_frag_free` 能正确找到复合页的头页。
 - **以后可以换成 page_pool**，作为独立补丁，不和 ZC 绑在一起。
 
 ### 7.3 ZC 的 RX
 
-**补 buffer（`rtl8125_xsk_ring_fill`）**
+**补 buffer（实现名 `rtl8125_xsk_rx_fill`）**
 - 用 `xsk_buff_alloc_batch` 批量申请，处理 ring 回绕。
-- 每个 buffer 都调用 `rtl8125_map_to_asic(tp, ring, desc, xsk_buff_xdp_get_dma(xdp), tp->rx_buf_sz, i)`。**每次都重写 `addr`**，自然避开了 V3/V4 的覆盖问题。
+- 每个 buffer 都经导出的 `rtl8125_rx_arm()`（包装 `rtl8125_map_to_asic`）交给硬件。**每次都重写 `addr`**，自然避开了 V3/V4 的覆盖问题。
 - **允许只补到一部分。** 用户态常常先 bind、后填 fill 环。补不满时不报错：
-  - 打开了 need_wakeup：调用 `xsk_set_rx_need_wakeup`，并且 init_ring 视为成功；
+  - init_ring 视为成功，缺的数量记进 `dirty_rx`（`dirty_rx -= num_rx_desc - filled`），poll 里自然补上；
   - 没有 buffer 的描述符 `DescOwn = 0`，硬件会停在这里，等补满后自然继续。
 - 重建时（§3 隐患 C 已修复，NAPI 已停）先 clear 再 fill：被 `xsk_buff_free` 归还的 buffer 进入 free_list，`alloc_batch` 优先取回它们，**不依赖 fill 环**。
 
-**主循环（`rtl8125_rx_zc`）**
-1. 读 `opts1`（用官方的 `rtl8125_rx_desc_opts1`，屏蔽 V1/V3/V4 差异）；如果 `DescOwn` 还在，沿用官方的 `recheck_desc_ownbit` 和 `desc_quirk` 处理。
-2. `rmb()`；用 `rtl8125_check_rx_desc_error` 检查错误。出错的包：同一个 xdp 原地重新交给硬件（重写 addr），计数，继续。
-3. 计算 `pkt_size`（去掉 FCS，同官方）；如果是分片帧，丢弃并原地重新交给硬件（第一版不做多缓冲）。
-4. `xsk_buff_set_size(xdp, pkt_size)`，然后 `rtl8125_xsk_sync_for_cpu(xdp, pool)`。
-5. `bpf_prog_run_xdp`：
+**实现：不另写收包循环。** 设计初稿是独立的 `rtl8125_rx_zc`，但它要用到的描述符解析、错误检查、校验和、VLAN 函数在官方代码里都是热路径上的 `static inline`，全部导出会让官方页路径失去内联。实现改为同一个收包循环服务两种环：
+1. 描述符的读取、`DescOwn` / `recheck_desc_ownbit`、`rmb()`、错误检查、`pkt_size`、分片帧丢弃全部沿用官方代码。
+2. 只有"缓冲区怎么处理"一步分叉：ZC 环调用 `rtl8125_xsk_rx()`——`xsk_buff_set_size` + `rtl8125_xsk_sync_for_cpu` 后运行程序：
    - `REDIRECT`：`xdp_do_redirect`，失败则 `xsk_buff_free`
-   - `TX`：转成帧后走 §7.4；失败则 free
-   - `PASS`：`rtl8125_xsk_construct_skb`，然后复用官方的 `rtl8125_rx_csum`、`rtl8125_rx_vlan_skb` / `rtl8125_rx_skb`，最后 `xsk_buff_free`
+   - `TX`：`xdp_convert_buff_to_frame` 拷贝成独立的页（原 buffer 随即归还）后走 §7.4
+   - `PASS`：`rtl8125_xsk_construct_skb` 拷贝成 skb 返回给循环，循环做完校验和（和 RSS hash）后 `goto rx_skb_ready` 汇入官方的 `eth_type_trans` / VLAN / `rtl8125_rx_skb`
    - `DROP` / 其他：`xsk_buff_free`
-6. 槽位清空；循环结束后 `rtl8125_xsk_ring_fill` 补到 dirty_rx，再调用 `rtl8125_xdp_finalize`。
-7. 打开了 need_wakeup 时：补失败或 ring 空了就 set，否则 clear；不打开 need_wakeup 时，补失败就返回 budget，让 NAPI 再次 poll（igc 的写法）。
+3. 无论哪种判决，槽位都留空；出错帧经 `rtl8125_recycle_rx_buffer()` 开头的分流直接还给 pool。于是"`dirty_rx` 到 `cur_rx` 之间都是空槽"在两种环上都成立，循环末尾的补充（`rtl8125_rx_fill` 开头分流到 `rtl8125_xsk_rx_fill`）不用改。
+4. 打开了 need_wakeup 时：补不满就 set，否则 clear；不打开 need_wakeup 时，补不满就返回 budget 让 NAPI 继续轮询（H17）。实测：不加这一条时，"先挂程序、不开 need_wakeup"的 l2fwd 会在突发时丢掉约 0.35% 的帧。
 
-**归还（`rtl8125_xsk_ring_clear`）：** 对每个非空的 `rxb->xdp` 调用 `xsk_buff_free` 并置 NULL。调用时 NAPI 一定已经停了（close / rebuild，以及修复后的 link down / ESD / reset 路径）。
+**归还（实现名 `rtl8125_xsk_rx_clear`）：** 对每个非空的 `rxb->xdp` 调用 `xsk_buff_free` 并置 NULL。调用时 NAPI 一定已经停了（close / rebuild，以及修复后的 link down / ESD / reset 路径）。
 
 ### 7.4 TX：XDP_TX、`ndo_xdp_xmit`、XSK 统一写描述符，统一释放
 
@@ -461,7 +469,7 @@ WRITE_ONCE(ring->cur_tx, cur_tx + ndesc)
 |---|---|---|
 | `XDP_TX`（页路径 / ZC） | `tx_ring[smp_processor_id() % num_tx_rings]` | RX NAPI 中；门铃在 `rtl8125_xdp_finalize` 里持锁敲一次 |
 | `ndo_xdp_xmit` | 同上 | 任意 CPU；带 `XDP_XMIT_FLUSH` 时敲门铃；返回成功发出的帧数 |
-| XSK TX（`rtl8125_xsk_tx`） | `tx_ring[q]`，q 与绑定的 rx 队列相同 | H11：TX 清理之后、持锁；`xsk_tx_peek_release_desc_batch(pool, 空闲槽位 / 2)`；`xsk_buff_raw_get_dma` + `raw_dma_sync_for_device`；XSK 的 `len = 0`（不 unmap）；最后敲门铃，并 `xsk_set_tx_need_wakeup` |
+| XSK TX（实现名 `rtl8125_xsk_xmit`） | `tx_ring[q]`，q 与绑定的 rx 队列相同 | H11：TX 清理之后、持锁；`xsk_tx_peek_release_desc_batch(pool, 空闲槽位 / 2)`，**不受 NAPI budget 限制**（TX 不计入 budget，一次唤醒可以填满环）；`xsk_buff_raw_get_dma` + `raw_dma_sync_for_device`；XSK 的 `len = 0`（不 unmap）；最后敲门铃，并 `xsk_set_tx_need_wakeup` |
 
 **统一释放（H10，`rtl8125_tx_release`）**
 
@@ -555,11 +563,12 @@ ISR v1 / v3 / v4 下 RX 和 TX 是同一个 NAPI，`kick` 两次时第二次会�
 
 ### 7.8 `xdp_rxq_info`
 
-- open 时对每个 rx 环调用 `xdp_rxq_info_reg(&ring->xdp_rxq, dev, i, rtl8125_q_napi(tp, i, false)->napi_id)`；close 时 unreg。
+- **实现：** 在 `rtl8125_alloc_rx_desc` 里对每个 rx 环 `xdp_rxq_info_reg(&ring->xdp_rxq, dev, i, napi_id)`，在 `rtl8125_free_rx_desc` 里 unreg（H13）。队列号用循环变量：`ring->index` 要到 init_ring 才赋值。
 - `rtl8125_xdp_ring_setup`（H5）先 `xdp_rxq_info_unreg_mem_model`，再注册对应的内存模型：
   - ZC：`MEM_TYPE_XSK_BUFF_POOL` + `xsk_pool_set_rxq_info(pool, &ring->xdp_rxq)`
   - 其他：`MEM_TYPE_PAGE_SHARED`
-- `xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT | NETDEV_XDP_ACT_XSK_ZEROCOPY`（第 6 个补丁才加 XSK_ZEROCOPY）。`ndo_xdp_xmit` 的能力（redirect target）随挂/卸程序动态设置。
+- **实现：NAPI id。** 从 6.13 起 NAPI id 在 `napi_enable` 时才分配，且驱动没有持久的 NAPI 配置时每次 enable 都会换新 id；`xdp_rxq_info.napi_id` 在 6.13 被删掉，AF_XDP 改为从 `netif_queue_set_napi()` 登记的队列映射里取。所以 `rtl8125_enable_napi()` 末尾调用 `rtl8125_xdp_napi_enabled()`（H16）：6.13 之前写 `xdp_rxq.napi_id`，6.8 起对 RX 和 TX 队列都调用 `netif_queue_set_napi()`（持 rtnl，所有调用方都满足）。
+- **实现：** `xdp_features` 在 probe 时一次设好：`BASIC | REDIRECT | NDO_XMIT | XSK_ZEROCOPY`。TX 环始终存在，`ndo_xdp_xmit` 不依赖程序是否挂着，所以不需要随挂/卸程序动态切换 redirect target。
 
 ---
 
@@ -579,24 +588,29 @@ ISR v1 / v3 / v4 下 RX 和 TX 是同一个 NAPI，`kick` 两次时第二次会�
 
 ## 9. 补丁序列
 
-每个补丁都能单独编译和测试。
+每个补丁都能单独编译和测试。下表是实际提交的序列（`main`）。
 
-| # | 补丁 | 是否改变行为 |
-|---|---|---|
-| 0 | `vendor`：原样导入 Realtek 9.018.00 | — |
-| 1 | 修复隐患 A：`NET_IP_ALIGN = 2` 架构上 build_skb 漏了 reserve | 修 bug（已完成） |
-| 2 | 修复隐患 B：`reset_task` 改为正规的 clear + init_ring | 修 bug（已完成；V3/V4 描述符场景尚未上机） |
-| 3 | 修复隐患 C：提取 `rtl8125_reset_rings()`，link down / ESD 路径改为先停 NAPI；`change_mtu` 重建失败时也重新打开 NAPI | 修 bug（已完成；ESD 路径未能人为触发） |
-| 4 | 重构：提取 `rtl8125_rings_rebuild()`，`change_mtu` 改为调用它 | 不变（已完成） |
-| 5 | 重构：提取 `rtl8125_tx_release()`；`ring_info` 加 type 字段（`SKB = 0`）；`rx_page_order` 改为按 headroom 计算；`tp->rx_headroom` | 不变 |
-| 6 | 框架：`r8125_xdp.[ch]`、Makefile 开关、兼容宏、空函数、`xdp_rxq_info` 注册 | 关掉开关时不变 |
-| 7 | 原生 XDP：页路径 DROP / PASS + `XDP_SETUP_PROG` | 新功能 |
-| 8 | XDP_TX + `ndo_xdp_xmit` + PTP 勘误填充描述符 | 新功能 → **AF_XDP copy 模式可用；软路由场景的终点**：用 `xdp-forward` 和 nft flowtable 对比实测 |
-| 9 | XSK 零拷贝 RX：pool 设置、wakeup、`rx_zc`、拷贝版 PASS | 新功能（可选，给 AF_XDP / DPDK `net/af_xdp` 用户） |
-| 10 | XSK 零拷贝 TX，打开 `NETDEV_XDP_ACT_XSK_ZEROCOPY` | 新功能（可选） |
-| 11+ | 后续可选：XDP RX hash 元数据、`netif_queue_set_napi`（≥ 6.8）、多缓冲 / jumbo、page_pool | — |
+| # | 提交 | 是否改变行为 | 上机验证（A7Z） |
+|---|---|---|---|
+| 0 | `vendor`：原样导入 Realtek 9.018.00 | — | — |
+| 1 | 隐患 A：页复用路径无条件 `skb_reserve(rx_offset)` | 修 bug | 第 0 步 1~258 字节偏移 |
+| 2 | 隐患 B：`reset_task` 改为 clear + `init_ring` | 修 bug | 7 次 reset × TCP 流，10.3 GiB（V3/V4 未上机） |
+| 3 | 隐患 C：`rtl8125_reset_rings()`；`change_mtu` 失败也重开 NAPI | 修 bug | 6 次重新协商 + 4 次改 MTU，7.5 GiB（ESD 未能触发） |
+| 4 | `rtl8125_rings_rebuild()` | 不变 | 6 次改 MTU，14.9 GiB |
+| 5 | 隐患 D：丢包经 `dirty_rx` 回收 | 修 bug | 修复前每万次丢包泄漏约 5000 页，修复后为 0 |
+| 6 | `rtl8125_tx_release()` + `ring_info.type` | 不变 | 后续全部 TX 测试 |
+| 7 | `tp->rx_headroom`，按 headroom 计算页阶数 | 不变 | 同上 |
+| 8 | 页复用路径只同步收到的字节 + 预取 | 性能 | 95 kpps 全协议栈下无可测差别 |
+| 9 | XDP 框架：文件、Makefile、`xdp_rxq`、队列到 NAPI 映射 | 关掉开关时不变 | — |
+| 10 | 页路径 XDP：DROP / PASS / REDIRECT，挂/卸程序 | 新功能 | 挂卸 × TCP 流、DROP 无泄漏、cpumap |
+| 11 | XDP_TX + `ndo_xdp_xmit` + 8125A/B 勘误填充 | 新功能 → 软路由终点 | 回弹 / devmap、81 字节 PTP 填充 |
+| 12 | AF_XDP 零拷贝 RX | 新功能 | 校验和、PASS 混合流量、生命周期 |
+| 13 | AF_XDP 零拷贝 TX，声明 `XSK_ZEROCOPY` | 新功能 | l2fwd、各长度 TX、发送速率 |
+| — | `tools/xdp/` 测试程序，`docs/XDP.md` | — | — |
 
-Realtek 发新版时：更新 `vendor` 分支，`git rebase`。补丁 1~3 可以单独整理后反馈给 Realtek（nicfae@realtek.com）。
+后续可选：XDP RX hash 元数据、多缓冲 / jumbo、page_pool（转发场景下页复用失败率高时再做，见 XDP.md）、ethtool coalesce + DIM、开 RSS 后的多队列零拷贝。
+
+Realtek 发新版时：更新 `vendor` 分支，`git rebase`。补丁 1~3 和 5 可以单独整理后反馈给 Realtek（nicfae@realtek.com）。
 
 ---
 
