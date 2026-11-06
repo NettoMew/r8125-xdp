@@ -2534,6 +2534,7 @@ struct rtl8125_private {
         //struct ring_info tx_skb[MAX_NUM_TX_DESC];   /* Tx data buffers */
         unsigned rx_buf_sz;
 #ifdef ENABLE_PAGE_REUSE
+        unsigned rx_headroom;   /* bytes in front of every received frame */
         unsigned rx_buf_page_order;
         unsigned rx_buf_page_size;
         u32 page_reuse_fail_cnt;

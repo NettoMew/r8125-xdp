@@ -18309,10 +18309,11 @@ rtl8125_remove_one(struct pci_dev *pdev)
 }
 
 #ifdef ENABLE_PAGE_REUSE
-static inline unsigned int rtl8125_rx_page_order(unsigned rx_buf_sz, unsigned page_size)
+/* Each page holds two buffers, each with its headroom and skb_shared_info */
+static inline unsigned int rtl8125_rx_page_order(unsigned rx_buf_sz, unsigned headroom)
 {
         unsigned truesize = SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) +
-                            SKB_DATA_ALIGN(rx_buf_sz + R8125_RX_ALIGN);
+                            SKB_DATA_ALIGN(rx_buf_sz + headroom);
 
         return get_order(truesize * 2);
 }
@@ -18332,7 +18333,8 @@ rtl8125_set_rxbufsize(struct rtl8125_private *tp,
         tp->rx_buf_sz =  SKB_DATA_ALIGN(RX_BUF_SIZE);
 #endif //ENABLE_RX_PACKET_FRAGMENT
 #ifdef ENABLE_PAGE_REUSE
-        tp->rx_buf_page_order = rtl8125_rx_page_order(tp->rx_buf_sz, PAGE_SIZE);
+        tp->rx_headroom = R8125_RX_ALIGN;
+        tp->rx_buf_page_order = rtl8125_rx_page_order(tp->rx_buf_sz, tp->rx_headroom);
         tp->rx_buf_page_size = rtl8125_rx_page_size(tp->rx_buf_page_order);
 #endif //ENABLE_PAGE_REUSE
 }
@@ -19673,7 +19675,7 @@ rtl8125_init_ring(struct net_device *dev)
         for (i = 0; i < tp->num_rx_rings; i++) {
                 struct rtl8125_rx_ring *ring = &tp->rx_ring[i];
 #ifdef ENABLE_PAGE_REUSE
-                ring->rx_offset = R8125_RX_ALIGN;
+                ring->rx_offset = tp->rx_headroom;
 #else
                 memset(ring->Rx_skbuff, 0x0, sizeof(ring->Rx_skbuff));
 #endif //ENABLE_PAGE_REUSE
