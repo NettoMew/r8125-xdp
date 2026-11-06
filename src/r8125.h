@@ -2137,10 +2137,14 @@ enum rx_desc_len {
  * the memset() in init_ring need no change. */
 enum rtl8125_tx_type {
         RTL_TX_SKB = 0,
+        RTL_TX_XDP,             /* XDP_TX or ndo_xdp_xmit: return the xdp_frame */
 };
 
 struct ring_info {
-        struct sk_buff  *skb;
+        union {
+                struct sk_buff   *skb;
+                struct xdp_frame *xdpf;
+        };
         u32     len;            /* non-zero: this descriptor owns a DMA mapping */
         unsigned int   bytecount;
         unsigned short gso_segs;
@@ -2542,6 +2546,8 @@ struct rtl8125_private {
         unsigned rx_buf_sz;
 #ifdef ENABLE_XDP_SUPPORT
         struct bpf_prog *xdp_prog;
+        void *tx_pad_buf;       /* zeros for the 8125A/B PTP erratum, NULL elsewhere */
+        dma_addr_t tx_pad_dma;
 #endif //ENABLE_XDP_SUPPORT
 #ifdef ENABLE_PAGE_REUSE
         unsigned rx_headroom;   /* bytes in front of every received frame */
@@ -3044,6 +3050,12 @@ void rtl8125_tx_clear(struct rtl8125_private *tp);
 void rtl8125_rx_clear(struct rtl8125_private *tp);
 int rtl8125_init_ring(struct net_device *dev);
 unsigned int rtl8125_mtu_to_rms(unsigned int mtu);
+bool rtl8125_require_pad_ptp_pkt(struct rtl8125_private *tp);
+bool rtl8125_tx_slots_avail(struct rtl8125_private *tp,
+                            struct rtl8125_tx_ring *ring);
+u32 rtl8125_get_txd_opts1(struct rtl8125_tx_ring *ring, u32 opts1, u32 len,
+                          unsigned int entry);
+void rtl8125_doorbell(struct rtl8125_private *tp, struct rtl8125_tx_ring *ring);
 #ifdef ENABLE_PAGE_REUSE
 void rtl8125_put_rx_buffer(struct rtl8125_private *tp,
                            struct rtl8125_rx_ring *ring,

@@ -17757,6 +17757,7 @@ static const struct net_device_ops rtl8125_netdev_ops = {
 #endif
 #ifdef ENABLE_XDP_SUPPORT
         .ndo_bpf            = rtl8125_xdp_bpf,
+        .ndo_xdp_xmit       = rtl8125_xdp_xmit,
 #endif
 };
 #endif
@@ -19763,6 +19764,9 @@ rtl8125_tx_release(struct rtl8125_private *tp,
                         RTL_NAPI_CONSUME_SKB_ANY(ri->skb, done->budget);
                 }
                 break;
+        default:
+                rtl8125_xdp_tx_release(ri, done);
+                break;
         }
 
         ri->skb = NULL;
@@ -20178,7 +20182,7 @@ rtl8125_tx_timeout(struct net_device *dev)
         rtl8125_schedule_reset_work(tp);
 }
 
-static u32
+u32
 rtl8125_get_txd_opts1(struct rtl8125_tx_ring *ring,
                       u32 opts1,
                       u32 len,
@@ -20349,7 +20353,7 @@ static int msdn_giant_send_check(struct sk_buff *skb)
 }
 #endif
 
-static bool rtl8125_require_pad_ptp_pkt(struct rtl8125_private *tp)
+bool rtl8125_require_pad_ptp_pkt(struct rtl8125_private *tp)
 {
         switch (tp->mcfg) {
         case CFG_METHOD_2 ... CFG_METHOD_7:
@@ -20649,8 +20653,8 @@ rtl8125_tso_csum(struct sk_buff *skb,
         return true;
 }
 
-static bool rtl8125_tx_slots_avail(struct rtl8125_private *tp,
-                                   struct rtl8125_tx_ring *ring)
+bool rtl8125_tx_slots_avail(struct rtl8125_private *tp,
+                            struct rtl8125_tx_ring *ring)
 {
         unsigned int slots_avail = READ_ONCE(ring->dirty_tx) + ring->num_tx_desc
                                    - READ_ONCE(ring->cur_tx);
@@ -20665,8 +20669,8 @@ rtl8125_fast_mod_mask(const u32 input, const u32 mask)
         return input > mask ? input & mask : input;
 }
 
-static void rtl8125_doorbell(struct rtl8125_private *tp,
-                             struct rtl8125_tx_ring *ring)
+void rtl8125_doorbell(struct rtl8125_private *tp,
+                      struct rtl8125_tx_ring *ring)
 {
         if (tp->EnableTxNoClose) {
                 if (tp->HwSuppTxNoCloseVer > 3)

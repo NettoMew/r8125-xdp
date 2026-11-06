@@ -33,6 +33,7 @@ struct rtl8125_rx_frame {
 
 /* What an RX poll left for rtl8125_xdp_finalize() */
 #define RTL8125_XDP_REDIR       BIT(0)
+#define RTL8125_XDP_TX          BIT(1)
 
 struct napi_struct *rtl8125_q_napi(struct rtl8125_private *tp, u32 q, bool tx);
 
@@ -50,6 +51,25 @@ bool rtl8125_xdp_rx(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring,
                     u32 cur_rx, struct rtl8125_rx_buffer *rxb,
                     struct rtl8125_rx_frame *frame, u32 *status);
 void rtl8125_xdp_finalize(struct rtl8125_private *tp, u32 status);
+
+int rtl8125_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+                     u32 flags);
+
+/* Release what a non-skb TX descriptor completes */
+static inline void rtl8125_xdp_tx_release(struct ring_info *ri,
+                                          struct rtl8125_tx_done *done)
+{
+        if (!done->teardown) {
+                done->packets++;
+                done->bytes += ri->bytecount;
+        }
+
+        switch (ri->type) {
+        case RTL_TX_XDP:
+                xdp_return_frame(ri->xdpf);
+                break;
+        }
+}
 
 /* An attached program wants XDP_PACKET_HEADROOM in front of every frame */
 static inline unsigned int rtl8125_xdp_headroom(struct rtl8125_private *tp)
@@ -98,6 +118,9 @@ static inline bool rtl8125_xdp_rx(struct rtl8125_private *tp,
 #endif
 
 static inline void rtl8125_xdp_finalize(struct rtl8125_private *tp, u32 status) {}
+
+static inline void rtl8125_xdp_tx_release(struct ring_info *ri,
+                                          struct rtl8125_tx_done *done) {}
 
 static inline unsigned int rtl8125_xdp_headroom(struct rtl8125_private *tp)
 {
