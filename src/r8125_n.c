@@ -19909,7 +19909,6 @@ static void rtl8125_reset_task(struct work_struct *work)
                 container_of(work, struct rtl8125_private, reset_task.work);
         struct net_device *dev = tp->dev;
 #endif
-        int i;
 
         rtnl_lock();
 
@@ -19926,21 +19925,17 @@ static void rtl8125_reset_task(struct work_struct *work)
         rtl8125_hw_reset(dev);
 
         rtl8125_tx_clear(tp);
+        rtl8125_rx_clear(tp);
 
-        rtl8125_init_ring_indexes(tp);
-
-        rtl8125_tx_desc_init(tp);
-        for (i = 0; i < tp->num_rx_rings; i++) {
-                struct rtl8125_rx_ring *ring;
-                u32 entry;
-
-                ring = &tp->rx_ring[i];
-                for (entry = 0; entry < ring->num_rx_desc; entry++) {
-                        struct RxDesc *desc;
-
-                        desc = rtl8125_get_rxdesc(tp, ring->RxDescArray, entry);
-                        rtl8125_mark_to_asic(tp, desc, tp->rx_buf_sz);
-                }
+        /*
+         * Rebuild the RX rings from scratch rather than handing every
+         * descriptor back as is. Descriptors written back in V3/V4 format
+         * carry RSS data where the buffer address was, and slots whose
+         * refill failed have no buffer at all.
+         */
+        if (rtl8125_init_ring(dev) < 0) {
+                netdev_err(dev, "Failed to rebuild rings, retrying reset\n");
+                rtl8125_schedule_reset_work(tp);
         }
 
 #ifdef ENABLE_PTP_SUPPORT
