@@ -3018,6 +3018,9 @@ void rtl8125_hw_reset(struct net_device *dev);
 void rtl8125_tx_clear(struct rtl8125_private *tp);
 void rtl8125_rx_clear(struct rtl8125_private *tp);
 int rtl8125_init_ring(struct net_device *dev);
+int rtl8125_rings_rebuild(struct net_device *dev,
+                          void (*mutate)(struct rtl8125_private *tp, void *arg),
+                          void *arg);
 void rtl8125_hw_set_rx_packet_filter(struct net_device *dev);
 void rtl8125_enable_hw_linkchg_interrupt(struct rtl8125_private *tp);
 int rtl8125_dump_tally_counter(struct rtl8125_private *tp, dma_addr_t paddr);

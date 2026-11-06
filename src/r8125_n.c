@@ -19188,28 +19188,30 @@ rtl8125_hw_start(struct net_device *dev)
         rtl8125_lib_reset_complete(tp);
 }
 
-static int
-rtl8125_change_mtu(struct net_device *dev,
-                   int new_mtu)
+/*
+ * Rebuild the rings around a configuration change. mutate() runs while
+ * the device is quiesced and its rings are empty, so it may change
+ * anything the RX buffer layout depends on; on a device that is not
+ * running it is simply applied. Callers hold rtnl.
+ */
+int
+rtl8125_rings_rebuild(struct net_device *dev,
+                      void (*mutate)(struct rtl8125_private *tp, void *arg),
+                      void *arg)
 {
         struct rtl8125_private *tp = netdev_priv(dev);
-        int ret = 0;
+        int ret;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
-        if (new_mtu < ETH_MIN_MTU)
-                return -EINVAL;
-        else if (new_mtu > tp->max_jumbo_frame_size)
-                new_mtu = tp->max_jumbo_frame_size;
-#endif //LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
-
-        dev->mtu = new_mtu;
-
-        tp->eee.tx_lpi_timer = dev->mtu + ETH_HLEN + 0x20;
-
-        if (!netif_running(dev))
-                goto out;
+        if (!netif_running(dev)) {
+                if (mutate)
+                        mutate(tp, arg);
+                return 0;
+        }
 
         rtl8125_down(dev);
+
+        if (mutate)
+                mutate(tp, arg);
 
         rtl8125_set_rxbufsize(tp, dev);
 
@@ -19225,22 +19227,50 @@ rtl8125_change_mtu(struct net_device *dev,
 #endif//CONFIG_R8125_NAPI
 
         if (ret < 0)
-                goto err_out;
+                return ret;
 
         if (tp->link_ok(dev))
                 rtl8125_link_on_patch(dev);
         else
                 rtl8125_link_down_patch(dev);
 
-        //mod_timer(&tp->esd_timer, jiffies + RTL8125_ESD_TIMEOUT);
-        //mod_timer(&tp->link_timer, jiffies + RTL8125_LINK_TIMEOUT);
-out:
+        return 0;
+}
+
+static void
+rtl8125_set_mtu(struct rtl8125_private *tp, void *arg)
+{
+        struct net_device *dev = tp->dev;
+
+        dev->mtu = *(int *)arg;
+
+        tp->eee.tx_lpi_timer = dev->mtu + ETH_HLEN + 0x20;
+}
+
+static int
+rtl8125_change_mtu(struct net_device *dev,
+                   int new_mtu)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
+        struct rtl8125_private *tp = netdev_priv(dev);
+#endif //LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
+        int ret;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
+        if (new_mtu < ETH_MIN_MTU)
+                return -EINVAL;
+        else if (new_mtu > tp->max_jumbo_frame_size)
+                new_mtu = tp->max_jumbo_frame_size;
+#endif //LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
+
+        ret = rtl8125_rings_rebuild(dev, rtl8125_set_mtu, &new_mtu);
+        if (ret < 0)
+                return ret;
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0)
         netdev_update_features(dev);
 #endif
-
-err_out:
-        return ret;
+        return 0;
 }
 
 static inline void
