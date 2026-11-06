@@ -5246,6 +5246,27 @@ rtl8125_link_on_patch(struct net_device *dev)
 #endif // ENABLE_PTP_SUPPORT
 }
 
+/*
+ * Free and refill both rings. Callers hold rtnl and enter with NAPI
+ * enabled; NAPI is stopped while the buffers are freed, so that no poll
+ * on another CPU can still be using them, and enabled again on return.
+ */
+static void
+rtl8125_reset_rings(struct net_device *dev)
+{
+        struct rtl8125_private *tp = netdev_priv(dev);
+
+        _rtl8125_wait_for_quiescence(dev);
+        rtl8125_hw_reset(dev);
+        rtl8125_tx_clear(tp);
+        rtl8125_rx_clear(tp);
+        if (rtl8125_init_ring(dev) < 0)
+                netdev_err(dev, "Failed to refill the RX rings\n");
+#ifdef CONFIG_R8125_NAPI
+        rtl8125_enable_napi(tp);
+#endif //CONFIG_R8125_NAPI
+}
+
 static void
 rtl8125_link_down_patch(struct net_device *dev)
 {
@@ -5270,13 +5291,7 @@ rtl8125_link_down_patch(struct net_device *dev)
 
         netif_tx_disable(dev);
 
-        rtl8125_hw_reset(dev);
-
-        rtl8125_tx_clear(tp);
-
-        rtl8125_rx_clear(tp);
-
-        rtl8125_init_ring(dev);
+        rtl8125_reset_rings(dev);
 
         rtl8125_enable_hw_linkchg_interrupt(tp);
 
@@ -17421,10 +17436,7 @@ rtl8125_esd_checker(struct rtl8125_private *tp)
                 printk(KERN_ERR "%s: esd_flag = 0x%04x\n.\n", dev->name, tp->esd_flag);
                 netif_carrier_off(dev);
                 netif_tx_disable(dev);
-                rtl8125_hw_reset(dev);
-                rtl8125_tx_clear(tp);
-                rtl8125_rx_clear(tp);
-                rtl8125_init_ring(dev);
+                rtl8125_reset_rings(dev);
                 rtl8125_up(dev);
                 rtl8125_enable_hw_linkchg_interrupt(tp);
                 rtl8125_set_speed(dev, tp->autoneg, tp->speed, tp->duplex, tp->advertising);
@@ -19203,12 +19215,17 @@ rtl8125_change_mtu(struct net_device *dev,
 
         ret = rtl8125_init_ring(dev);
 
-        if (ret < 0)
-                goto err_out;
-
+        /*
+         * Re-enable NAPI even when the refill failed: the device is still
+         * running, and both rtl8125_reset_rings() and close expect NAPI
+         * to be enabled.
+         */
 #ifdef CONFIG_R8125_NAPI
         rtl8125_enable_napi(tp);
 #endif//CONFIG_R8125_NAPI
+
+        if (ret < 0)
+                goto err_out;
 
         if (tp->link_ok(dev))
                 rtl8125_link_on_patch(dev);
