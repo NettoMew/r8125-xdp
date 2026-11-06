@@ -107,8 +107,21 @@ static inline void rtl8125_xdp_tx_release(struct ring_info *ri,
         case RTL_TX_XDP:
                 xdp_return_frame(ri->xdpf);
                 break;
+        case RTL_TX_XSK:
+                done->xsk_frames++;
+                break;
         }
 }
+
+/* Hand completed, or abandoned, zero-copy frames back to the socket */
+static inline void rtl8125_xdp_tx_done(struct rtl8125_tx_ring *ring,
+                                       const struct rtl8125_tx_done *done)
+{
+        if (done->xsk_frames)
+                xsk_tx_completed(ring->xsk_pool, done->xsk_frames);
+}
+
+void rtl8125_xsk_xmit(struct rtl8125_tx_ring *ring);
 
 /* An attached program wants XDP_PACKET_HEADROOM in front of every frame */
 static inline unsigned int rtl8125_xdp_headroom(struct rtl8125_private *tp)
@@ -189,6 +202,9 @@ static inline void rtl8125_xdp_finalize(struct rtl8125_private *tp, u32 status) 
 
 static inline void rtl8125_xdp_tx_release(struct ring_info *ri,
                                           struct rtl8125_tx_done *done) {}
+static inline void rtl8125_xdp_tx_done(struct rtl8125_tx_ring *ring,
+                                       const struct rtl8125_tx_done *done) {}
+static inline void rtl8125_xsk_xmit(struct rtl8125_tx_ring *ring) {}
 
 static inline unsigned int rtl8125_xdp_headroom(struct rtl8125_private *tp)
 {

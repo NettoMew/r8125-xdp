@@ -19814,6 +19814,8 @@ rtl8125_tx_clear_range(struct rtl8125_private *tp,
 
         for (i = 0; i < n; i++)
                 rtl8125_tx_release(tp, ring, (start + i) % ring->num_tx_desc, &done);
+
+        rtl8125_xdp_tx_done(ring, &done);
 }
 
 void
@@ -20902,6 +20904,8 @@ rtl8125_tx_interrupt_noclose(struct rtl8125_tx_ring *ring, int budget)
                 tx_left--;
         }
 
+        rtl8125_xdp_tx_done(ring, &done);
+
         if (done.packets) {
                 netdev_tx_completed_queue(txring_txq(ring),
                                           done.packets, done.bytes);
@@ -20958,6 +20962,8 @@ rtl8125_tx_interrupt_close(struct rtl8125_tx_ring *ring, int budget)
                 tx_left--;
         }
 
+        rtl8125_xdp_tx_done(ring, &done);
+
         if (done.packets) {
                 netdev_tx_completed_queue(txring_txq(ring),
                                           done.packets, done.bytes);
@@ -20986,11 +20992,17 @@ static int
 rtl8125_tx_interrupt(struct rtl8125_tx_ring *ring, int budget)
 {
         struct rtl8125_private *tp = ring->priv;
+        int count;
 
         if (tp->EnableTxNoClose)
-                return rtl8125_tx_interrupt_noclose(ring, budget);
+                count = rtl8125_tx_interrupt_noclose(ring, budget);
         else
-                return rtl8125_tx_interrupt_close(ring, budget);
+                count = rtl8125_tx_interrupt_close(ring, budget);
+
+        /* Frames an AF_XDP socket queued in zero-copy mode */
+        rtl8125_xsk_xmit(ring);
+
+        return count;
 }
 
 static int

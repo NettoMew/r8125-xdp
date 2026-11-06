@@ -2138,6 +2138,7 @@ enum rx_desc_len {
 enum rtl8125_tx_type {
         RTL_TX_SKB = 0,
         RTL_TX_XDP,             /* XDP_TX or ndo_xdp_xmit: return the xdp_frame */
+        RTL_TX_XSK,             /* AF_XDP zero-copy: complete it to the pool */
 };
 
 struct ring_info {
@@ -2157,6 +2158,7 @@ struct rtl8125_tx_done {
         bool teardown;          /* the descriptors are abandoned, not completed */
         unsigned int packets;
         unsigned int bytes;
+        unsigned int xsk_frames;
 };
 
 struct pci_resource {
@@ -2224,6 +2226,10 @@ struct rtl8125_tx_ring {
         u16 sw_tail_ptr_reg;
 
         u16 tdsar_reg; /* Transmit Descriptor Start Address */
+
+#ifdef ENABLE_XDP_SUPPORT
+        struct xsk_buff_pool *xsk_pool; /* the one of the RX ring with the same index */
+#endif //ENABLE_XDP_SUPPORT
 };
 
 struct rtl8125_rx_buffer {

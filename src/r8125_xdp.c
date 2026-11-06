@@ -127,7 +127,7 @@ int rtl8125_xdp_init(struct rtl8125_private *tp)
         }
 
         tp->dev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
-                                NETDEV_XDP_ACT_NDO_XMIT;
+                                NETDEV_XDP_ACT_NDO_XMIT | NETDEV_XDP_ACT_XSK_ZEROCOPY;
 
         return 0;
 }
@@ -218,6 +218,7 @@ static void rtl8125_xsk_set_pool(struct rtl8125_private *tp, void *arg)
         const struct rtl8125_xsk_binding *b = arg;
 
         tp->rx_ring[b->qid].xsk_pool = b->pool;
+        tp->tx_ring[b->qid].xsk_pool = b->pool;
 }
 
 /*
@@ -770,4 +771,47 @@ void rtl8125_xdp_finalize(struct rtl8125_private *tp, u32 status)
                         rtl8125_xdp_tx_unlock(ring);
                 }
         }
+}
+
+/*
+ * Send what an AF_XDP socket queued on a zero-copy queue, as much as half
+ * the free descriptors take, since a frame may need a padding descriptor.
+ * TX work does not count against the NAPI budget, so a single wakeup can
+ * fill the ring. The frames go out straight from the UMEM and complete to
+ * the pool in rtl8125_xdp_tx_done().
+ */
+void rtl8125_xsk_xmit(struct rtl8125_tx_ring *ring)
+{
+        struct rtl8125_private *tp = ring->priv;
+        struct xsk_buff_pool *pool = ring->xsk_pool;
+        struct xdp_desc *descs;
+        u32 i, n;
+
+        if (!pool || !tp->rx_ring[ring->index].zc)
+                return;
+
+        if (unlikely(!rtl8125_xdp_tx_lock(tp, ring)))
+                return;
+
+        n = xsk_tx_peek_release_desc_batch(pool, rtl8125_tx_free(ring) / 2);
+        descs = pool->tx_descs;
+        for (i = 0; i < n; i++) {
+                dma_addr_t dma = xsk_buff_raw_get_dma(pool, descs[i].addr);
+                void *data = xsk_buff_raw_get_data(pool, descs[i].addr);
+                u32 len = descs[i].len;
+
+                xsk_buff_raw_dma_sync_for_device(pool, dma, len);
+                rtl8125_xdp_post(tp, ring, dma, len, rtl8125_xdp_pad_len(tp, data, len),
+                                 false, RTL_TX_XSK, NULL);
+        }
+
+        if (n) {
+                rtl8125_doorbell(tp, ring);
+                rtl8125_xdp_tx_maybe_stop(tp, ring);
+        }
+
+        if (xsk_uses_need_wakeup(pool))
+                xsk_set_tx_need_wakeup(pool);
+
+        rtl8125_xdp_tx_unlock(ring);
 }
