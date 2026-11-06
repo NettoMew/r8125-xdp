@@ -209,7 +209,7 @@ class Dut:
         return pinger
 
     def driver_var(self, *keys):
-        text = read(Path("/proc/net", MODULE, self.iface, "driver_var"), "")
+        text = read(Path("/proc/net", MODULE, self.iface, "debug", "driver_var"), "")
         found = dict(line.split(None, 1) for line in text.splitlines()
                      if len(line.split(None, 1)) == 2)
         return {k: found.get(k) for k in keys}
