@@ -93,7 +93,7 @@ for n in /sys/class/net/*; do
 	run "ethtool -g $ifc"
 	run "ethtool -k $ifc | grep -E 'rx-checksumming|tx-checksumming|scatter-gather|tcp-segmentation|generic-receive|rx-all|rx-fcs'"
 	run "grep -c $ifc /proc/interrupts"
-	dv=/proc/net/r8125/$ifc/driver_var
+	dv=/proc/net/r8125/$ifc/debug/driver_var
 	if [ -r "$dv" ]; then
 		echo "driver_var (selected):"
 		grep -E '^(driver|mcfg|chipset|chipset_name|mtu|NUM_RX_DESC|NUM_TX_DESC|rx_buf_sz|rx_buf_page_order|rx_buf_page_size|page_reuse_fail_cnt|aspm|UseSwPaddingShortPkt|ShortPacketSwChecksum|HwSuppTxNoCloseVer|EnableTxNoClose|InitRxDescType|RxDescLength|num_rx_rings|num_tx_rings|HwSuppNumRxQueues|HwSuppNumTxQueues|EnableRss|EnablePtp|min_irq_nvecs|irq_nvecs|hw_supp_irq_nvecs|ring_lib_enabled|HwSuppIsrVer|HwCurrIsrVer)[[:space:]]' "$dv"
