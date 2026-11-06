@@ -2130,12 +2130,26 @@ enum rx_desc_len {
         RX_DESC_LEN_TYPE_4 = (sizeof(struct RxDescV4))
 };
 
+/* What a TX descriptor completes. Zero is a plain skb, so start_xmit() and
+ * the memset() in init_ring need no change. */
+enum rtl8125_tx_type {
+        RTL_TX_SKB = 0,
+};
+
 struct ring_info {
         struct sk_buff  *skb;
-        u32     len;
+        u32     len;            /* non-zero: this descriptor owns a DMA mapping */
         unsigned int   bytecount;
         unsigned short gso_segs;
-        u8      __pad[sizeof(void *) - sizeof(u32)];
+        u8      type;           /* enum rtl8125_tx_type, valid on the last descriptor of a frame */
+};
+
+/* What one pass over completed or abandoned TX descriptors released */
+struct rtl8125_tx_done {
+        int budget;             /* NAPI budget, 0 outside NAPI */
+        bool teardown;          /* the descriptors are abandoned, not completed */
+        unsigned int packets;
+        unsigned int bytes;
 };
 
 struct pci_resource {

@@ -19705,34 +19705,55 @@ rtl8125_unmap_tx_skb(struct pci_dev *pdev,
         tx_skb->len = 0;
 }
 
+/*
+ * Release one TX descriptor: drop its DMA mapping if it owns one and free
+ * whatever it completes. Every TX completion and teardown path ends here.
+ */
+static void
+rtl8125_tx_release(struct rtl8125_private *tp,
+                   struct rtl8125_tx_ring *ring,
+                   unsigned int entry,
+                   struct rtl8125_tx_done *done)
+{
+        struct ring_info *ri = ring->tx_skb + entry;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,22)
+        struct net_device *dev = tp->dev;
+#endif
+
+        if (ri->len)
+                rtl8125_unmap_tx_skb(tp->pci_dev, ri, ring->TxDescArray + entry);
+
+        switch (ri->type) {
+        case RTL_TX_SKB:
+                if (!ri->skb)
+                        break;
+
+                if (done->teardown) {
+                        RTLDEV->stats.tx_dropped++;
+                        dev_kfree_skb_any(ri->skb);
+                } else {
+                        done->packets += ri->gso_segs;
+                        done->bytes += ri->bytecount;
+                        RTL_NAPI_CONSUME_SKB_ANY(ri->skb, done->budget);
+                }
+                break;
+        }
+
+        ri->skb = NULL;
+        ri->type = RTL_TX_SKB;
+}
+
 static void
 rtl8125_tx_clear_range(struct rtl8125_private *tp,
                        struct rtl8125_tx_ring *ring,
                        u32 start,
                        unsigned int n)
 {
+        struct rtl8125_tx_done done = { .teardown = true };
         unsigned int i;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,22)
-        struct net_device *dev = tp->dev;
-#endif
 
-        for (i = 0; i < n; i++) {
-                unsigned int entry = (start + i) % ring->num_tx_desc;
-                struct ring_info *tx_skb = ring->tx_skb + entry;
-                unsigned int len = tx_skb->len;
-
-                if (len) {
-                        struct sk_buff *skb = tx_skb->skb;
-
-                        rtl8125_unmap_tx_skb(tp->pci_dev, tx_skb,
-                                             ring->TxDescArray + entry);
-                        if (skb) {
-                                RTLDEV->stats.tx_dropped++;
-                                dev_kfree_skb_any(skb);
-                                tx_skb->skb = NULL;
-                        }
-                }
-        }
+        for (i = 0; i < n; i++)
+                rtl8125_tx_release(tp, ring, (start + i) % ring->num_tx_desc, &done);
 }
 
 void
@@ -20800,7 +20821,7 @@ rtl8125_desc_quirk(struct rtl8125_private *tp)
 static int
 rtl8125_tx_interrupt_noclose(struct rtl8125_tx_ring *ring, int budget)
 {
-        unsigned int total_bytes = 0, total_packets = 0;
+        struct rtl8125_tx_done done = { .budget = budget };
         struct rtl8125_private *tp = ring->priv;
         struct net_device *dev = tp->dev;
         unsigned int dirty_tx, tx_left;
@@ -20816,31 +20837,17 @@ rtl8125_tx_interrupt_noclose(struct rtl8125_tx_ring *ring, int budget)
         ring->BeginHwDesCloPtr += tx_left;
 
         while (tx_left > 0) {
-                unsigned int entry = dirty_tx % ring->num_tx_desc;
-                struct ring_info *tx_skb = ring->tx_skb + entry;
-
-                rtl8125_unmap_tx_skb(tp->pci_dev,
-                                     tx_skb,
-                                     ring->TxDescArray + entry);
-
-                if (tx_skb->skb != NULL) {
-                        /* update the statistics for this packet */
-                        total_bytes += tx_skb->bytecount;
-                        total_packets += tx_skb->gso_segs;
-
-                        RTL_NAPI_CONSUME_SKB_ANY(tx_skb->skb, budget);
-                        tx_skb->skb = NULL;
-                }
+                rtl8125_tx_release(tp, ring, dirty_tx % ring->num_tx_desc, &done);
                 dirty_tx++;
                 tx_left--;
         }
 
-        if (total_packets) {
+        if (done.packets) {
                 netdev_tx_completed_queue(txring_txq(ring),
-                                          total_packets, total_bytes);
+                                          done.packets, done.bytes);
 
-                RTLDEV->stats.tx_bytes += total_bytes;
-                RTLDEV->stats.tx_packets+= total_packets;
+                RTLDEV->stats.tx_bytes += done.bytes;
+                RTLDEV->stats.tx_packets+= done.packets;
         }
 
         if (ring->dirty_tx != dirty_tx) {
@@ -20860,7 +20867,7 @@ rtl8125_tx_interrupt_noclose(struct rtl8125_tx_ring *ring, int budget)
 static int
 rtl8125_tx_interrupt_close(struct rtl8125_tx_ring *ring, int budget)
 {
-        unsigned int total_bytes = 0, total_packets = 0;
+        struct rtl8125_tx_done done = { .budget = budget };
         struct rtl8125_private *tp = ring->priv;
         struct net_device *dev = tp->dev;
         unsigned int dirty_tx, tx_left;
@@ -20872,7 +20879,6 @@ rtl8125_tx_interrupt_close(struct rtl8125_tx_ring *ring, int budget)
 
         while (tx_left > 0) {
                 unsigned int entry = dirty_tx % ring->num_tx_desc;
-                struct ring_info *tx_skb = ring->tx_skb + entry;
 
                 status = le32_to_cpu(READ_ONCE(ring->TxDescArray[entry].opts1));
                 if (status & DescOwn) {
@@ -20887,28 +20893,17 @@ rtl8125_tx_interrupt_close(struct rtl8125_tx_ring *ring, int budget)
                                 break;
                 }
 
-                rtl8125_unmap_tx_skb(tp->pci_dev,
-                                     tx_skb,
-                                     ring->TxDescArray + entry);
-
-                if (tx_skb->skb != NULL) {
-                        /* update the statistics for this packet */
-                        total_bytes += tx_skb->bytecount;
-                        total_packets += tx_skb->gso_segs;
-
-                        RTL_NAPI_CONSUME_SKB_ANY(tx_skb->skb, budget);
-                        tx_skb->skb = NULL;
-                }
+                rtl8125_tx_release(tp, ring, entry, &done);
                 dirty_tx++;
                 tx_left--;
         }
 
-        if (total_packets) {
+        if (done.packets) {
                 netdev_tx_completed_queue(txring_txq(ring),
-                                          total_packets, total_bytes);
+                                          done.packets, done.bytes);
 
-                RTLDEV->stats.tx_bytes += total_bytes;
-                RTLDEV->stats.tx_packets+= total_packets;
+                RTLDEV->stats.tx_bytes += done.bytes;
+                RTLDEV->stats.tx_packets+= done.packets;
         }
 
         if (ring->dirty_tx != dirty_tx) {
