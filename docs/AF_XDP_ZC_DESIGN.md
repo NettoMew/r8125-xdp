@@ -7,7 +7,7 @@
 | 内核范围 | **6.6 ~ 7.x**（已对 v6.6 / 6.8 / 6.9 / 6.10 / 6.12 / 6.13 / 6.14 / 6.18 / 7.3 头文件逐一核对） |
 | 已定决策 | ① 支持到 6.6 LTS；② 官方驱动隐患 A / B / C 全部修复 |
 | 主要场景 | 软路由（RTL8125 x86 小主机；NanoPi R5S / R5C、Radxa E52C 等 Rockchip arm64 板） |
-| 文档状态 | 设计稿，尚未写任何驱动代码 |
+| 文档状态 | 第 0 步实测已完成（2026-11-06，Cubie A7Z + RTL8125B，结果见 §10.1），补丁序列从补丁 1 开始编码 |
 
 > **范围说明（2026-11 调研后补充）：** 对软路由来说，真正有用的终点是**补丁 8**（原生 XDP + `ndo_xdp_xmit`，配合 xdp-tools 的 `xdp-forward`）。补丁 9~10 的零拷贝只服务于 AF_XDP 用户态程序，包括 DPDK `net/af_xdp`，列为可选。DPDK 原生 `net/r8169` 在 Rockchip 平台上不可用（§2.4），因此 DPDK 在这些板子上唯一可行的路径就是"本方案 + `net/af_xdp`"。
 
@@ -58,19 +58,19 @@
 | RX 长度字段 | V1 为 14 位，V3/V4 为 15 位（看 `RsvdMask`） | `r8125.h:2025-2027` |
 | TX 描述符 | 32 字节；opts1 包含 Own / RingEnd / FirstFrag / LastFrag / len | `r8125.h:2029`、`1852-1855` |
 | TX 完成 | TxNoClose 模式（默认）读硬件的 closed pointer 计数器，天然适合批量 `xsk_tx_completed(n)` | `r8125_n.c:20759` |
-| 短包填充 | **所有芯片** `UseSwPaddingShortPkt = TRUE`，短于 60 字节必须软件补齐。8125A/B（CFG 2~7）还有 PTP/UDP 勘误。上游 r8169 实现了同样的逻辑 | `r8125_n.c:15469`、`20322-20392`；r8169 `rtl_quirk_packet_padto` |
+| 短包填充 | 官方对**所有芯片**设 `UseSwPaddingShortPkt = TRUE`，但实测硬件会自己补零到 60 字节（§2.5）。8125A/B（CFG 2~7）的 PTP/UDP 勘误实测存在，必须保留。上游 r8169 实现了同样的逻辑 | `r8125_n.c:15469`、`20322-20392`；r8169 `rtl_quirk_packet_padto`；§10.1 |
 | 填充缓冲常量 | `SHORT_PACKET_PADDING_BUF_SIZE = 256` 已定义但未使用，可以直接用 | `r8125.h:750` |
 | `ring_info` | 本身有 `__pad[sizeof(void*) - 4]`，加类型字段不会让结构变大 | `r8125.h:2134-2140` |
 | lib ring | Makefile 引用了 `r8125_lib.c`，但源码包中**没有这个文件**，必须和 XDP 互斥 | `ls src/` |
 | 回环 | 不支持 `NETIF_F_LOOPBACK`，`xskxceiver` 需要两个口或环回线 | grep 结果为 0 |
 | 已处理的最高内核版本 | 源码中最高判断到 `KERNEL_VERSION(6,13,0)` | grep |
 
-### 2.2 RX 缓冲地址对齐：**未知，必须实测**
+### 2.2 RX 缓冲地址对齐：**任意字节对齐都可以（已实测）**
 
-- 旧版 r8169 中 8168 家族写明 `.align = 8`（v2.6.30），v4.4 为 16 字节对齐。8168KB 就在 r8125 的芯片表里。
-- 官方 r8125 在 `NET_IP_ALIGN = 2` 的架构上（riscv / loongarch / mips / arm32，已确认它们没有自己定义这个宏）确实会把"页地址 + 2"写进描述符。但见隐患 A：这条路径在这些架构上本身就有 bug，不能当作硬件可以接受的证据。
-- x86 / arm64 / powerpc 上 `NET_IP_ALIGN = 0`。
-- **结论：** 实测之前按 8 字节对齐设计，实测方法见 §10.1。
+- 旧版 r8169 中 8168 家族写明 `.align = 8`（v2.6.30），v4.4 为 16 字节对齐。8168KB 就在 r8125 的芯片表里。设计初稿因此按 8 字节对齐保守设计。
+- 官方 r8125 在 `NET_IP_ALIGN = 2` 的架构上（riscv / loongarch / mips / arm32）确实会把"页地址 + 2"写进描述符，但这条路径本身有隐患 A，不能当作证据。
+- **实测（§10.1）：** RTL8125B 上把缓冲区起点依次放在页内偏移 0、1、2、4、8、16、32、64、258 字节处，全部通过逐字节比对，协议栈和网卡错误计数都没有变化。偏移 1 也能通过，说明 DMA 引擎直接使用描述符里的字节地址，没有向下对齐。
+- **结论：** RX 缓冲地址没有对齐要求。§8 不设对齐规则，unaligned pool 可以接受，headroom 取任何值都可以。
 
 ### 2.3 参考驱动的关键事实
 
@@ -100,11 +100,16 @@
   - `XDP_TX` 的 `dma_map_single(TO_DEVICE)` 会把缓存刷回内存。
 - 反过来，DPDK 原生 PMD 不做缓存维护，所以在 Rockchip 上不可用。Realtek 2022 年在 ARM SoC 上移植 RTL8125 PMD 时出现的 RDU 卡死，就是这个原因。
 
-### 2.5 短包填充：两份 Realtek 代码说法矛盾
+### 2.5 短包填充：硬件自己补零，PTP 勘误真实存在（已实测）
 
 - 内核厂商驱动对所有芯片都设置了 `UseSwPaddingShortPkt = TRUE`，上游 r8169 也对 8125 强制填充到 60 字节。
-- 但 DPDK `net/r8169`（同样出自 Realtek）**对非 UDP 的短包在任何芯片上都不做软件填充**，只在 PTP 勘误路径里顺带补到 60 字节（`r8169_rxtx.c:1549`、`:1614`）。
-- 由此推测：硬件很可能会自动补齐短包。§10.1 第 4 项会实测；实测之前，§7.4 仍然按保守做法使用填充描述符。
+- DPDK `net/r8169`（同样出自 Realtek）对非 UDP 的短包在任何芯片上都不做软件填充，只在 PTP 勘误路径里顺带补到 60 字节（`r8169_rxtx.c:1549`、`:1614`）。
+- **实测（§10.1，RTL8125B / CFG_5）：**
+  1. 关掉全部软件填充后，42 和 59 字节的 UDP 帧在线上都是 60 字节，填充全是零，IP / UDP 校验和正确。**硬件会自己补零。**
+  2. 关掉勘误填充后，发往 UDP 319 / 320 的短帧**一帧都到不了对端**。驱动的发送计数照常增加，对端网卡也没有任何接收错误计数，帧根本没有出现在线上。
+  3. 只保留通用填充（补到 60 字节）也不行，结果和第 2 条一样。勘误看的是 L4 长度：UDP 头加负载必须达到 `MIN_PATCH_LEN = 47` 字节（IPv4 下整帧 81 字节），只补到 60 字节不够。
+- **结论：** 普通短帧不需要软件填充；8125A/B 的 PTP 勘误填充必须保留，而且必须按官方的 `rtl8125_get_patch_pad_len` 计算长度。§7.4 据此简化。
+- **注意：** 只测了 CFG_5 一种芯片。其他 `mcfg` 是否同样补零，由 §10.2 的短包用例逐一确认（§11 R9）。
 
 ---
 
@@ -117,6 +122,7 @@
 - **位置：** `rtl8125_rx_interrupt` 页复用分支（约 `r8125_n.c:21331-21337`）。
 - **原因：** `build_skb(rxb->data + page_offset - rx_offset, ...)` 让 skb head 指向 buffer 开头，而 DMA 写入位置是 `buffer + rx_offset`。内核 ≥ 3.19 且开了 NAPI 时 `R8125_USE_NAPI_ALLOC_SKB = 1`，于是 `if (!R8125_USE_NAPI_ALLOC_SKB) skb_reserve(skb, R8125_RX_ALIGN)` 被跳过，`skb->data` 比包头早 `rx_offset` 字节。这个条件本来是给 `napi_alloc_skb` 路径用的（它内部已经 reserve 了 NET_IP_ALIGN），被误用到了 `build_skb` 路径上。
 - **影响：** 只影响 `NET_IP_ALIGN = 2` 的架构。x86 / arm64 上 `rx_offset = 0`，不受影响。
+- **已上机验证：** 第 0 步在 arm64 上用模块参数把 `rx_offset` 设成非零值，模拟了这些架构的情况。带着这个修复，1~258 的所有非零偏移都收发正确（§10.1）。
 - **修复：** 页复用分支里无条件 `skb_reserve(skb, ring->rx_offset)`。非页复用（skb）分支保持原样。
 
 ### 隐患 B：开 RSS（V3/V4 描述符）时，`reset_task` 可能让硬件 DMA 到垃圾地址
@@ -427,7 +433,7 @@ xdp_prepare_buff(&xdp, hard_start, ring->rx_offset, pkt_size, false);
 **写描述符（`rtl8125_xdp_tx_frame`，调用者持 `__netif_tx_lock`）**
 
 ```
-padto = rtl8125_xdp_padto(tp, data, len);  /* max(ETH_ZLEN, PTP 勘误长度)，只对 CFG 2~7 套用 PTP 勘误 */
+padto = rtl8125_xdp_padto(tp, data, len);  /* 只有 CFG 2~7 的 PTP 勘误帧返回 > len，其余一律返回 len */
 ndesc = (padto > len) ? 2 : 1;
 检查空闲槽位 >= ndesc，否则返回 -EBUSY
 如果需要填充：描述符 1 = tp->tx_pad_dma，长度 padto-len，LastFrag|Own（先写）
@@ -440,8 +446,8 @@ netdev_tx_sent_queue(txq, len)          /* BQL 要和完成时的统计对得上
 WRITE_ONCE(ring->cur_tx, cur_tx + ndesc)
 ```
 
-- **可能的简化（取决于 §10.1 第 4 项）：** 如果实测证明硬件会自动补齐短包，填充描述符就只在 8125A/B（CFG 2~7）的 PTP 勘误时才需要，其余芯片一律单描述符发送。
-- **为什么所有类型都用第二个描述符来填充：** UMEM 是用户的内存，不能往里写零；unaligned 模式下也不知道 chunk 的边界在哪；redirect 进来的帧尾部还有多少空间也不确定。一条路径适用于所有来源。
+- **普通短帧单描述符发送：** §10.1 实测硬件会自己补零到 60 字节，所以 42~59 字节的帧直接按原长度交给硬件，不再需要填充描述符。
+- **填充描述符只服务于 PTP 勘误：** 8125A/B 上 L4 长度不足 47 字节的 UDP 319 / 320 帧，不补就会被硬件悄悄丢掉（§2.5）。填充用第二个描述符而不是写进数据缓冲区，是因为 UMEM 是用户的内存，不能往里写零；unaligned 模式下也不知道 chunk 的边界在哪；redirect 进来的帧尾部还有多少空间也不确定。
 - **8125A/B 的 PTP 勘误：** `rtl8125_xdp_padto` 解析线性 buffer 中的 IPv4/IPv6 + UDP 目标端口 319/320，逻辑和官方 `rtl8125_get_patch_pad_len` / r8169 `rtl8125_quirk_udp_padto` 一样。
 - **发完之后：** 如果 `!rtl8125_tx_slots_avail()`，就 `netif_tx_stop_queue`。否则官方 `start_xmit` 会打印 *"BUG! Tx Ring full when queue awake"*（`r8125_n.c:20617`）。官方的完成路径会自动唤醒队列。
 - 每个调用点都调用 `txq_trans_cond_update(txq)`，避免误报 TX 超时（igc / igb 也这样做）。
@@ -562,7 +568,7 @@ ISR v1 / v3 / v4 下 RX 和 TX 是同一个 NAPI，`kick` 两次时第二次会�
 | 内核 ≥ 6.6 | 编译期 `#error` | §4 |
 | ZC 只允许 `qid < num_rx_rings && qid < num_tx_rings`（默认配置下就是只有队列 0） | pool 设置 | 和 igc / igb / fec 一致；TX 环不足 |
 | `xsk_pool_get_rx_frame_size(pool) >= tp->rx_buf_sz` | pool 设置、挂程序、改 MTU | ZC 描述符长度和全局 `rx_buf_sz` 一致，官方所有重新标记描述符的路径都不用改；2048 的 chunk 可用 1792 字节 ≥ 1522 |
-| RX 对齐（待 §10.1 实测）：如果需要 8 字节对齐，拒绝 `pool->unaligned`，并要求 `xsk_pool_get_headroom(pool) % 8 == 0` | pool 设置 | §2.2 |
+| RX 对齐：**不设规则**。unaligned pool 可以接受，headroom 取任何值都可以 | — | §2.2 实测任意字节对齐都可以 |
 | `XDP_SETUP_XSK_POOL(NULL)` 不允许失败 | pool 关闭 | §2.3 |
 | 开着 XDP 时改 MTU：重新检查上面的帧大小规则 | `rtl8125_xdp_check_mtu` | 防止 ZC 环被撑破 |
 
@@ -582,7 +588,7 @@ ISR v1 / v3 / v4 下 RX 和 TX 是同一个 NAPI，`kick` 两次时第二次会�
 | 5 | 重构：提取 `rtl8125_tx_release()`；`ring_info` 加 type 字段（`SKB = 0`）；`rx_page_order` 改为按 headroom 计算；`tp->rx_headroom` | 不变 |
 | 6 | 框架：`r8125_xdp.[ch]`、Makefile 开关、兼容宏、空函数、`xdp_rxq_info` 注册 | 关掉开关时不变 |
 | 7 | 原生 XDP：页路径 DROP / PASS + `XDP_SETUP_PROG` | 新功能 |
-| 8 | XDP_TX + `ndo_xdp_xmit` + 填充描述符 + PTP 勘误 | 新功能 → **AF_XDP copy 模式可用；软路由场景的终点**：用 `xdp-forward` 和 nft flowtable 对比实测 |
+| 8 | XDP_TX + `ndo_xdp_xmit` + PTP 勘误填充描述符 | 新功能 → **AF_XDP copy 模式可用；软路由场景的终点**：用 `xdp-forward` 和 nft flowtable 对比实测 |
 | 9 | XSK 零拷贝 RX：pool 设置、wakeup、`rx_zc`、拷贝版 PASS | 新功能（可选，给 AF_XDP / DPDK `net/af_xdp` 用户） |
 | 10 | XSK 零拷贝 TX，打开 `NETDEV_XDP_ACT_XSK_ZEROCOPY` | 新功能（可选） |
 | 11+ | 后续可选：XDP RX hash 元数据、`netif_queue_set_napi`（≥ 6.8）、多缓冲 / jumbo、page_pool | — |
@@ -602,17 +608,42 @@ Realtek 发新版时：更新 `vendor` 分支，`git rebase`。补丁 1~3 可以
    - 安装 bpftool、xdp-tools（`xdp-bench`）、bpf-examples（`xdpsock`）
    - 对端发包机：pktgen 或 TRex
 3. **确认芯片。** 读 `/proc/net/r8125/<ifname>/driver_var`，确认 `mcfg`（CFG_METHOD）、`HwCurrIsrVer`、`EnableTxNoClose`、`InitRxDescType`。
-4. **RX 对齐探测（只用于实验，不进补丁序列）。**
-   - 在 x86 上把 `ring->rx_offset` 依次设为 `2 / 4 / 8 / 256+2`，同时让 `build_skb` 后面无条件 `skb_reserve(skb, ring->rx_offset)`。
-   - 每个取值跑 ping、`iperf3 -u -l 1472/64`，对端抓包逐字节比对。
-   - 结果决定 §8 的对齐准入规则。
-4. **短包自动填充探测（只用于实验）。** 临时去掉 TX 路径上的软件填充，发 42 字节的 ARP 和 UDP（端口 319 和非 319 各一组），对端抓包看：线上是不是 60 字节、填充是不是全零。每种芯片版本各测一次，结果决定 §7.4 能不能简化。
-5. **基线数据。**
+4. **RX 对齐探测（已完成，结果见下）。** 用 `exp/phase0` 分支的模块参数 `rx_offset` 改变缓冲区偏移，做法见该分支的 `docs/PHASE0.md` §4。结果决定 §8 的对齐准入规则。
+5. **短包自动填充探测（已完成，结果见下）。** 用该分支的模块参数 `tx_pad` 关掉部分或全部软件填充，做法见 `docs/PHASE0.md` §5。结果决定 §7.4 能不能简化。
+6. **基线数据。**
    - generic XDP：`xdp-bench drop|tx -m skb`
    - copy 模式：`xdpsock -r / -t / -l -S -c`
    - 软路由：nft flowtable 下的转发 pps 和 CPU 占用（之后用来和补丁 8 的 `xdp-forward` 对比）
    - **硬件上限（只在 DMA 一致的平台上测）：** x86 上用 DPDK `testpmd` + `net/r8169` 跑 64B 的 rxonly / txonly。Realtek 公布的数字是 RTL8125B 64B 约 1709 Mbit/s，约 2.5~3.3 Mpps。Rockchip 板子上不测这一项（§2.4）
    - 记录 Mpps 和 CPU 占用，后面每个补丁都和这组数对比。
+
+#### 第 0 步实测结果（2026-11-06）
+
+**环境：** Radxa Cubie A7Z（Allwinner A733，arm64，PCIe DMA 非一致），通过 FPC 转接板外接 RTL8125B（`mcfg 5`，PCIe Gen2 x1）；Armbian trixie，vendor 内核 6.6.98；`exp/phase0` 分支（f656656）。驱动拿到 1 个中断向量（`HwCurrIsrVer = 1`），RX 描述符 V1，`EnableTxNoClose = 1`。
+
+**RX 对齐：** 对端是网关（OpenWrt，同样是 RTL8125），中间经过交换机。
+
+| 偏移 | 0 | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 258 |
+|---|---|---|---|---|---|---|---|---|---|
+| ICMP 逐字节比对（25 种长度 × 5 种内容 × 2 轮） | 250/250 | 250/250 | 250/250 | 250/250 | 250/250 | 250/250 | 250/250 | 250/250 | 250/250 |
+| 1 GiB 字节流坏块 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 页阶数 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+
+各项协议栈校验和错误计数和接口错误计数的增量都是 0。字节流速度约 260 MB/s，各偏移之间没有差别。
+
+**TX 短包填充：** A7Z 用网线直连 Windows 上的 Intel I225-V，用 `pktmon` 抓包。每组 20 帧。
+
+| 模式 | 目的端口 | 负载 0 字节（42 字节帧） | 负载 17 字节（59 字节帧） |
+|---|---|---|---|
+| 3（官方默认） | 9 | 60 字节，补零，校验和正确 | 同左 |
+| 3 | 319 / 320 | 81 字节（勘误填充），补零，校验和正确 | 同左 |
+| 1（只关勘误填充） | 9 | 60 字节，补零，校验和正确 | 同左 |
+| 1 | 319 / 320 | **一帧都没收到** | **一帧都没收到** |
+| 0（全部关掉） | 9 | **60 字节，补零，校验和正确（硬件补齐）** | 同左 |
+| 0 | 319 / 320 | **一帧都没收到** | **一帧都没收到** |
+
+- 模式 0 / 1 下 PTP 帧丢失时，驱动的 `tx_packets` 照常增加，`tx_errors` / `tx_dropped` 为 0，对端没有接收错误计数。
+- **抓包环境的教训：** 中间那台交换机会按 IPv4 总长度截掉帧尾，再补零到 60 字节（两个方向都会）。所以经过它抓包时，短帧的长度和填充内容都不可信；凡是和帧尾有关的测试，都必须直连。直连时，用原始套接字发出的 81 字节、尾部填 0x77 的对照帧能原样到达。
 
 ### 10.2 功能测试矩阵
 
@@ -636,14 +667,15 @@ Realtek 发新版时：更新 `vendor` 分支，`git rebase`。补丁 1~3 可以
 
 | # | 风险 | 应对 |
 |---|---|---|
-| R1 | RX 对齐要求未知 | §10.1 第 4 项实测；结论写进 §8 |
+| R1 | ~~RX 对齐要求未知~~ | **已解决：** §10.1 实测任意字节对齐都可以，§8 不设对齐规则 |
 | R2 | 非一致性 DMA 架构上，程序写 headroom 和 DMA 区域共用一条 cache line（`NET_IP_ALIGN = 2` 时边界不对齐） | **arm64 上不存在**：`NET_IP_ALIGN = 0`，256 字节的 headroom 天然按缓存行对齐。只在 32 位 arm / riscv / mips 上需要考虑，必要时让 headroom 按缓存行对齐 |
 | R8 | 硬件小包上限（约 2.5~3.3 Mpps）可能让补丁 9~10 的收益很小 | 先看 §10.1 的硬件上限和补丁 8 的实测，再决定做不做零拷贝 |
-| R3 | 硬件对很小的 TX 分片（填充描述符只有 1~59 字节）的处理没有文档 | skb 的 frag 本来就可能很小，属于中等置信度；短包测试必须覆盖 |
+| R3 | 硬件对很小的 TX 分片（勘误填充描述符只有 1~43 字节）的处理没有文档 | skb 的 frag 本来就可能很小，属于中等置信度；短包测试必须覆盖 |
 | R4 | 隐患 A/B/C 的修复改变了官方行为 | 每个单独一个补丁，可以单独回滚；回归测试覆盖 |
 | R5 | 重建失败会让设备停在 down 状态 | 和官方 `change_mtu` 的语义一致；打印错误。后续可以考虑先建新环再替换（fec 的写法） |
 | R6 | 官方驱动在 7.x 内核上能否编译没有验证（它最高只处理到 6.13） | 第 0 步先编译官方原版确认 |
 | R7 | 2.5G 下零拷贝的收益可能有限 | 第 8 个补丁之后做评估，再决定是否继续 |
+| R9 | 硬件自动补零只在 RTL8125B（CFG_5）上实测过，§7.4 的单描述符发送依赖它 | §10.2 的短包用例在每种芯片上都直连抓包确认；如果有芯片不补齐，对它额外打开填充描述符 |
 
 ---
 
