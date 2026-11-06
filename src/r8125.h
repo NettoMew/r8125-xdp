@@ -2540,6 +2540,9 @@ struct rtl8125_private {
         //struct sk_buff *Rx_skbuff[MAX_NUM_RX_DESC]; /* Rx data buffers */
         //struct ring_info tx_skb[MAX_NUM_TX_DESC];   /* Tx data buffers */
         unsigned rx_buf_sz;
+#ifdef ENABLE_XDP_SUPPORT
+        struct bpf_prog *xdp_prog;
+#endif //ENABLE_XDP_SUPPORT
 #ifdef ENABLE_PAGE_REUSE
         unsigned rx_headroom;   /* bytes in front of every received frame */
         unsigned rx_buf_page_order;
@@ -3040,6 +3043,16 @@ void rtl8125_hw_reset(struct net_device *dev);
 void rtl8125_tx_clear(struct rtl8125_private *tp);
 void rtl8125_rx_clear(struct rtl8125_private *tp);
 int rtl8125_init_ring(struct net_device *dev);
+unsigned int rtl8125_mtu_to_rms(unsigned int mtu);
+#ifdef ENABLE_PAGE_REUSE
+void rtl8125_put_rx_buffer(struct rtl8125_private *tp,
+                           struct rtl8125_rx_ring *ring,
+                           u32 cur_rx,
+                           struct rtl8125_rx_buffer *rxb);
+void rtl8125_recycle_rx_buffer(struct rtl8125_private *tp,
+                               struct rtl8125_rx_ring *ring,
+                               struct rtl8125_rx_buffer *rxb);
+#endif //ENABLE_PAGE_REUSE
 int rtl8125_rings_rebuild(struct net_device *dev,
                           void (*mutate)(struct rtl8125_private *tp, void *arg),
                           void *arg);

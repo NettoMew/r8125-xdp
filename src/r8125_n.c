@@ -17755,6 +17755,9 @@ static const struct net_device_ops rtl8125_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
         .ndo_poll_controller    = rtl8125_netpoll,
 #endif
+#ifdef ENABLE_XDP_SUPPORT
+        .ndo_bpf            = rtl8125_xdp_bpf,
+#endif
 };
 #endif
 
@@ -18225,6 +18228,10 @@ rtl8125_init_one(struct pci_dev *pdev,
 
         rtl8125_tally_counter_clear(tp);
 
+        rc = rtl8125_xdp_init(tp);
+        if (rc)
+                goto err_out;
+
         pci_set_drvdata(pdev, dev);
 
         rc = register_netdev(dev);
@@ -18249,6 +18256,7 @@ out:
         return rc;
 
 err_out:
+        rtl8125_xdp_exit(tp);
         if (tp->tally_vaddr != NULL) {
                 dma_free_coherent(&pdev->dev, sizeof(*tp->tally_vaddr), tp->tally_vaddr,
                                   tp->tally_paddr);
@@ -18289,6 +18297,7 @@ rtl8125_remove_one(struct pci_dev *pdev)
 #endif //ENABLE_R8125_SYSFS
 
         unregister_netdev(dev);
+        rtl8125_xdp_exit(tp);
 #ifdef  CONFIG_R8125_NAPI
         rtl8125_del_napi(tp);
 #endif
@@ -18321,21 +18330,26 @@ static inline unsigned int rtl8125_rx_page_order(unsigned rx_buf_sz, unsigned he
 }
 #endif //ENABLE_PAGE_REUSE
 
+/* Largest frame, with VLAN tag and FCS, the hardware accepts at an MTU */
+unsigned int
+rtl8125_mtu_to_rms(unsigned int mtu)
+{
+        return (mtu > ETH_DATA_LEN) ?
+               mtu + ETH_HLEN + RT_VALN_HLEN + ETH_FCS_LEN:
+               RX_BUF_SIZE;
+}
+
 static void
 rtl8125_set_rxbufsize(struct rtl8125_private *tp,
                       struct net_device *dev)
 {
-        unsigned int mtu = dev->mtu;
-
-        tp->rms = (mtu > ETH_DATA_LEN) ?
-                  mtu + ETH_HLEN + RT_VALN_HLEN + ETH_FCS_LEN:
-                  RX_BUF_SIZE;
+        tp->rms = rtl8125_mtu_to_rms(dev->mtu);
         tp->rx_buf_sz = tp->rms;
 #ifdef ENABLE_RX_PACKET_FRAGMENT
         tp->rx_buf_sz =  SKB_DATA_ALIGN(RX_BUF_SIZE);
 #endif //ENABLE_RX_PACKET_FRAGMENT
 #ifdef ENABLE_PAGE_REUSE
-        tp->rx_headroom = R8125_RX_ALIGN;
+        tp->rx_headroom = rtl8125_xdp_headroom(tp);
         tp->rx_buf_page_order = rtl8125_rx_page_order(tp->rx_buf_sz, tp->rx_headroom);
         tp->rx_buf_page_size = rtl8125_rx_page_size(tp->rx_buf_page_order);
 #endif //ENABLE_PAGE_REUSE
@@ -19270,6 +19284,10 @@ rtl8125_change_mtu(struct net_device *dev,
         else if (new_mtu > tp->max_jumbo_frame_size)
                 new_mtu = tp->max_jumbo_frame_size;
 #endif //LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
+
+        ret = rtl8125_xdp_check_mtu(netdev_priv(dev), new_mtu);
+        if (ret < 0)
+                return ret;
 
         ret = rtl8125_rings_rebuild(dev, rtl8125_set_mtu, &new_mtu);
         if (ret < 0)
@@ -21216,10 +21234,10 @@ rtl8125_reuse_rx_buffer(struct rtl8125_private *tp, struct rtl8125_rx_ring *ring
         }
 }
 
-static void rtl8125_put_rx_buffer(struct rtl8125_private *tp,
-                                  struct rtl8125_rx_ring *ring,
-                                  u32 cur_rx,
-                                  struct rtl8125_rx_buffer *rxb)
+void rtl8125_put_rx_buffer(struct rtl8125_private *tp,
+                           struct rtl8125_rx_ring *ring,
+                           u32 cur_rx,
+                           struct rtl8125_rx_buffer *rxb)
 {
         struct rtl8125_rx_buffer *nrxb;
         struct page *page = rxb->page;
@@ -21263,9 +21281,9 @@ static void rtl8125_put_rx_buffer(struct rtl8125_private *tp,
  * every slot from dirty_rx up to cur_rx stays empty and the refill at the
  * end of the poll never overwrites a buffer that is still in use.
  */
-static void rtl8125_recycle_rx_buffer(struct rtl8125_private *tp,
-                                      struct rtl8125_rx_ring *ring,
-                                      struct rtl8125_rx_buffer *rxb)
+void rtl8125_recycle_rx_buffer(struct rtl8125_private *tp,
+                               struct rtl8125_rx_ring *ring,
+                               struct rtl8125_rx_buffer *rxb)
 {
         u32 entry = ring->dirty_rx % ring->num_rx_desc;
         struct rtl8125_rx_buffer *nrxb = &ring->rx_buffer[entry];
@@ -21310,11 +21328,13 @@ rtl8125_rx_interrupt(struct net_device *dev,
         u32 ring_index = ring->index;
 #ifdef ENABLE_PAGE_REUSE
         struct rtl8125_rx_buffer *rxb;
+        struct rtl8125_rx_frame frame;
 #else //ENABLE_PAGE_REUSE
         u64 rx_buf_phy_addr;
 #endif //ENABLE_PAGE_REUSE
         unsigned int total_rx_multicast_packets = 0;
         unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+        u32 xdp_status = 0;
 
         assert(dev != NULL);
         assert(tp != NULL);
@@ -21417,6 +21437,15 @@ rtl8125_rx_interrupt(struct net_device *dev,
                                               DMA_FROM_DEVICE);
                 prefetch(rxb->data + rxb->page_offset);
 
+                frame.offset = ring->rx_offset;
+                frame.len = pkt_size;
+                frame.metasize = 0;
+                if (rtl8125_xdp_rx(tp, ring, cur_rx, rxb, &frame, &xdp_status)) {
+                        total_rx_packets++;
+                        total_rx_bytes += pkt_size;
+                        continue;
+                }
+
                 skb = rxb->skb;
                 rxb->skb = NULL;
                 if (!skb) {
@@ -21427,9 +21456,10 @@ rtl8125_rx_interrupt(struct net_device *dev,
                         }
 
                         skb->dev = dev;
-                        /* build_skb() starts at the buffer, DMA lands rx_offset in */
-                        skb_reserve(skb, ring->rx_offset);
-                        skb_put(skb, pkt_size);
+                        /* build_skb() starts at the buffer, the frame lies frame.offset in */
+                        skb_reserve(skb, frame.offset);
+                        skb_put(skb, frame.len);
+                        rtl8125_xdp_skb_meta(skb, &frame);
 #ifdef ENABLE_RSS_SUPPORT
                         rtl8125_rx_hash(tp, desc, skb);
 #endif
@@ -21532,6 +21562,8 @@ drop_packet:
 
         count = cur_rx - ring->cur_rx;
         ring->cur_rx = cur_rx;
+
+        rtl8125_xdp_finalize(tp, xdp_status);
 
         delta = rtl8125_rx_fill(tp, ring, dev, ring->dirty_rx, ring->cur_rx, 1);
         if (!delta && count && netif_msg_intr(tp))
