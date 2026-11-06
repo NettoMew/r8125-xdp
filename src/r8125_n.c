@@ -85,6 +85,7 @@
 #include <asm/irq.h>
 
 #include "r8125.h"
+#include "r8125_xdp.h"
 #include "rtl_eeprom.h"
 #include "rtltool.h"
 #include "r8125_firmware.h"
@@ -17952,6 +17953,7 @@ void rtl8125_enable_napi(struct rtl8125_private *tp)
         for (i = 0; i < tp->irq_nvecs; i++)
                 RTL_NAPI_ENABLE(tp->dev, &tp->r8125napi[i].napi);
 #endif
+        rtl8125_xdp_napi_enabled(tp);
 }
 
 static void rtl8125_disable_napi(struct rtl8125_private *tp)
@@ -18485,6 +18487,9 @@ static int rtl8125_alloc_rx_desc(struct rtl8125_private *tp)
 
                 if (!ring->RxDescArray)
                         return -1;
+
+                if (rtl8125_xdp_rxq_reg(tp, ring, i) < 0)
+                        return -1;
         }
 
         return 0;
@@ -18516,6 +18521,7 @@ static void rtl8125_free_rx_desc(struct rtl8125_private *tp)
 
         for (i = 0; i < tp->num_rx_rings; i++) {
                 ring = &tp->rx_ring[i];
+                rtl8125_xdp_rxq_unreg(ring);
                 if (ring->RxDescArray) {
                         dma_free_coherent(&pdev->dev,
                                           ring->RxDescAllocSize,

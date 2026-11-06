@@ -51,6 +51,9 @@
 #ifdef ENABLE_LIB_SUPPORT
 #include "r8125_lib.h"
 #endif
+#ifdef ENABLE_XDP_SUPPORT
+#include <net/xdp.h>
+#endif
 
 #ifndef fallthrough
 #define fallthrough
@@ -2246,6 +2249,10 @@ struct rtl8125_rx_ring {
 #endif //ENABLE_PAGE_REUSE
 
         u16 rdsar_reg; /* Receive Descriptor Start Address */
+
+#ifdef ENABLE_XDP_SUPPORT
+        struct xdp_rxq_info xdp_rxq;
+#endif //ENABLE_XDP_SUPPORT
 };
 
 struct r8125_napi {

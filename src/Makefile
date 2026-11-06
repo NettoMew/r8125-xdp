@@ -52,6 +52,7 @@ ENABLE_DOUBLE_VLAN = n
 ENABLE_PAGE_REUSE = y
 ENABLE_RX_PACKET_FRAGMENT = n
 ENABLE_GIGA_LITE = y
+ENABLE_XDP_SUPPORT = y
 
 ifneq ($(KERNELRELEASE),)
 	obj-m := r8125.o
@@ -130,6 +131,15 @@ ifneq ($(KERNELRELEASE),)
 	endif
 	ifeq ($(ENABLE_GIGA_LITE), y)
 		EXTRA_CFLAGS += -DENABLE_GIGA_LITE
+	endif
+	# XDP and AF_XDP need Linux 6.6 or later and the page reuse RX path
+	# without packet fragments or the lib ring; otherwise the driver builds
+	# without them
+	ifeq ($(ENABLE_XDP_SUPPORT)$(ENABLE_PAGE_REUSE)$(ENABLE_RX_PACKET_FRAGMENT)$(ENABLE_LIB_SUPPORT), yynn)
+		ifeq ($(shell [ $(VERSION) -gt 6 -o \( $(VERSION) -eq 6 -a $(PATCHLEVEL) -ge 6 \) ] && echo y), y)
+			r8125-objs += r8125_xdp.o
+			EXTRA_CFLAGS += -DENABLE_XDP_SUPPORT
+		endif
 	endif
 
 	# Backward compatibility
