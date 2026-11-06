@@ -21254,6 +21254,41 @@ static void rtl8125_put_rx_buffer(struct rtl8125_private *tp,
         ring->dirty_rx++;
 }
 
+/*
+ * Hand the buffer of a frame that goes nowhere back to the hardware as it
+ * is. Like rtl8125_put_rx_buffer() it lands in the slot at dirty_rx, so
+ * every slot from dirty_rx up to cur_rx stays empty and the refill at the
+ * end of the poll never overwrites a buffer that is still in use.
+ */
+static void rtl8125_recycle_rx_buffer(struct rtl8125_private *tp,
+                                      struct rtl8125_rx_ring *ring,
+                                      struct rtl8125_rx_buffer *rxb)
+{
+        u32 entry = ring->dirty_rx % ring->num_rx_desc;
+        struct rtl8125_rx_buffer *nrxb = &ring->rx_buffer[entry];
+
+        if (nrxb != rxb) {
+                nrxb->page = rxb->page;
+                nrxb->page_offset = rxb->page_offset;
+                nrxb->dma = rxb->dma;
+                nrxb->data = rxb->data;
+                rxb->page = NULL;
+        }
+
+        dma_sync_single_range_for_device(tp_to_dev(tp),
+                                         nrxb->dma,
+                                         nrxb->page_offset,
+                                         tp->rx_buf_sz,
+                                         DMA_FROM_DEVICE);
+
+        rtl8125_map_to_asic(tp, ring,
+                            rtl8125_get_rxdesc(tp, ring->RxDescArray, entry),
+                            nrxb->dma + nrxb->page_offset,
+                            tp->rx_buf_sz, entry);
+
+        ring->dirty_rx++;
+}
+
 #endif //ENABLE_PAGE_REUSE
 
 static int
@@ -21470,6 +21505,9 @@ rtl8125_rx_interrupt(struct net_device *dev,
 #endif
 
 release_descriptor:
+#ifdef ENABLE_PAGE_REUSE
+                rtl8125_recycle_rx_buffer(tp, ring, &ring->rx_buffer[entry]);
+#else
                 switch (tp->InitRxDescType) {
                 case RX_DESC_RING_TYPE_3:
                 case RX_DESC_RING_TYPE_4:
@@ -21479,6 +21517,7 @@ release_descriptor:
                         break;
                 }
                 rtl8125_mark_to_asic(tp, desc, tp->rx_buf_sz);
+#endif //ENABLE_PAGE_REUSE
                 continue;
 drop_packet:
                 RTLDEV->stats.rx_dropped++;
