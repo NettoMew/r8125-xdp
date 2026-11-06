@@ -7,7 +7,7 @@
 | 内核范围 | **6.6 ~ 7.x**（已对 v6.6 / 6.8 / 6.9 / 6.10 / 6.12 / 6.13 / 6.14 / 6.18 / 7.3 头文件逐一核对） |
 | 已定决策 | ① 支持到 6.6 LTS；② 官方驱动隐患 A / B / C 全部修复 |
 | 主要场景 | 软路由（RTL8125 x86 小主机；NanoPi R5S / R5C、Radxa E52C 等 Rockchip arm64 板） |
-| 文档状态 | 第 0 步实测已完成（2026-11-06，Cubie A7Z + RTL8125B，结果见 §10.1），补丁序列从补丁 1 开始编码 |
+| 文档状态 | 第 0 步实测已完成（2026-11-06，Cubie A7Z + RTL8125B，结果见 §10.1）；补丁 1~3（隐患 A / B / C）已提交并上机验证 |
 
 > **范围说明（2026-11 调研后补充）：** 对软路由来说，真正有用的终点是**补丁 8**（原生 XDP + `ndo_xdp_xmit`，配合 xdp-tools 的 `xdp-forward`）。补丁 9~10 的零拷贝只服务于 AF_XDP 用户态程序，包括 DPDK `net/af_xdp`，列为可选。DPDK 原生 `net/r8169` 在 Rockchip 平台上不可用（§2.4），因此 DPDK 在这些板子上唯一可行的路径就是"本方案 + `net/af_xdp`"。
 
@@ -150,10 +150,13 @@ static void rtl8125_reset_rings(struct net_device *dev)
         rtl8125_hw_reset(dev);
         rtl8125_tx_clear(tp);
         rtl8125_rx_clear(tp);
-        rtl8125_init_ring(dev);
+        if (rtl8125_init_ring(dev) < 0)
+                netdev_err(dev, "Failed to refill the RX rings\n");
         rtl8125_enable_napi(tp);
 }
 ```
+
+- **补充修复（实现时发现）：** 官方 `change_mtu` 在 `init_ring` 失败时直接返回，NAPI 保持关闭，但设备仍在运行。之后再来一次 link down 就会对已关闭的 NAPI 再次 `napi_disable` 而永久阻塞；官方代码里 close 也会卡在同一处。补丁 3 让 `change_mtu` 无论重建成功与否都先重新打开 NAPI。
 
 - **对 XDP 的意义：** 这是 ZC 正确性的基础。修复后，link 抖动时 ZC 环可以放心地把 buffer 全部还给 pool 再取回（§2.3 最后一行），不需要专门的"保留 buffer"逻辑。
 
@@ -581,9 +584,9 @@ ISR v1 / v3 / v4 下 RX 和 TX 是同一个 NAPI，`kick` 两次时第二次会�
 | # | 补丁 | 是否改变行为 |
 |---|---|---|
 | 0 | `vendor`：原样导入 Realtek 9.018.00 | — |
-| 1 | 修复隐患 A：`NET_IP_ALIGN = 2` 架构上 build_skb 漏了 reserve | 修 bug |
-| 2 | 修复隐患 B：`reset_task` 改为正规的 clear + init_ring | 修 bug |
-| 3 | 修复隐患 C：提取 `rtl8125_reset_rings()`，link down / ESD 路径改为先停 NAPI | 修 bug |
+| 1 | 修复隐患 A：`NET_IP_ALIGN = 2` 架构上 build_skb 漏了 reserve | 修 bug（已完成） |
+| 2 | 修复隐患 B：`reset_task` 改为正规的 clear + init_ring | 修 bug（已完成；V3/V4 描述符场景尚未上机） |
+| 3 | 修复隐患 C：提取 `rtl8125_reset_rings()`，link down / ESD 路径改为先停 NAPI；`change_mtu` 重建失败时也重新打开 NAPI | 修 bug（已完成；ESD 路径未能人为触发） |
 | 4 | 重构：提取 `rtl8125_rings_rebuild()`，`change_mtu` 改为调用它 | 不变 |
 | 5 | 重构：提取 `rtl8125_tx_release()`；`ring_info` 加 type 字段（`SKB = 0`）；`rx_page_order` 改为按 headroom 计算；`tp->rx_headroom` | 不变 |
 | 6 | 框架：`r8125_xdp.[ch]`、Makefile 开关、兼容宏、空函数、`xdp_rxq_info` 注册 | 关掉开关时不变 |
