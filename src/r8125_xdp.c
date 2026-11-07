@@ -445,25 +445,19 @@ static struct rtl8125_tx_ring *rtl8125_xdp_tx_ring(struct rtl8125_private *tp)
 }
 
 /*
- * Lock a TX ring for XDP. The carrier is checked under the lock: the down
- * path drops the carrier before netif_tx_disable() takes every queue lock,
- * so a caller that wins the lock afterwards never touches a ring that is
- * being torn down.
+ * XDP shares the TX queue lock with the stack. Callers check the carrier
+ * with the lock held: the down path drops the carrier before
+ * netif_tx_disable() takes every queue lock, so whoever wins the lock
+ * afterwards sees the carrier off and leaves a ring being torn down alone.
  */
-static bool rtl8125_xdp_tx_lock(struct rtl8125_private *tp,
-                                struct rtl8125_tx_ring *ring)
+static void rtl8125_xdp_tx_lock(struct rtl8125_tx_ring *ring)
+        __acquires(&txring_txq(ring)->_xmit_lock)
 {
-        struct netdev_queue *txq = txring_txq(ring);
-
-        __netif_tx_lock(txq, smp_processor_id());
-        if (likely(netif_carrier_ok(tp->dev)))
-                return true;
-
-        __netif_tx_unlock(txq);
-        return false;
+        __netif_tx_lock(txring_txq(ring), smp_processor_id());
 }
 
 static void rtl8125_xdp_tx_unlock(struct rtl8125_tx_ring *ring)
+        __releases(&txring_txq(ring)->_xmit_lock)
 {
         struct netdev_queue *txq = txring_txq(ring);
 
@@ -482,8 +476,12 @@ int rtl8125_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
                 return -EINVAL;
 
         ring = rtl8125_xdp_tx_ring(tp);
-        if (unlikely(!rtl8125_xdp_tx_lock(tp, ring)))
+        rtl8125_xdp_tx_lock(ring);
+
+        if (unlikely(!netif_carrier_ok(dev))) {
+                rtl8125_xdp_tx_unlock(ring);
                 return -ENETDOWN;
+        }
 
         for (i = 0; i < n; i++)
                 if (rtl8125_xdp_xmit_frame(tp, ring, frames[i]))
@@ -512,10 +510,10 @@ static bool rtl8125_xdp_tx_back(struct rtl8125_private *tp, struct xdp_buff *xdp
                 return false;
         }
 
-        if (likely(rtl8125_xdp_tx_lock(tp, ring))) {
+        rtl8125_xdp_tx_lock(ring);
+        if (likely(netif_carrier_ok(tp->dev)))
                 err = rtl8125_xdp_xmit_frame(tp, ring, xdpf);
-                rtl8125_xdp_tx_unlock(ring);
-        }
+        rtl8125_xdp_tx_unlock(ring);
 
         if (unlikely(err)) {
                 xdp_return_frame_rx_napi(xdpf);
@@ -766,10 +764,10 @@ void rtl8125_xdp_finalize(struct rtl8125_private *tp, u32 status)
         if (status & RTL8125_XDP_TX) {
                 struct rtl8125_tx_ring *ring = rtl8125_xdp_tx_ring(tp);
 
-                if (rtl8125_xdp_tx_lock(tp, ring)) {
+                rtl8125_xdp_tx_lock(ring);
+                if (netif_carrier_ok(tp->dev))
                         rtl8125_doorbell(tp, ring);
-                        rtl8125_xdp_tx_unlock(ring);
-                }
+                rtl8125_xdp_tx_unlock(ring);
         }
 }
 
@@ -790,8 +788,11 @@ void rtl8125_xsk_xmit(struct rtl8125_tx_ring *ring)
         if (!pool || !tp->rx_ring[ring->index].zc)
                 return;
 
-        if (unlikely(!rtl8125_xdp_tx_lock(tp, ring)))
+        rtl8125_xdp_tx_lock(ring);
+        if (unlikely(!netif_carrier_ok(tp->dev))) {
+                rtl8125_xdp_tx_unlock(ring);
                 return;
+        }
 
         n = xsk_tx_peek_release_desc_batch(pool, rtl8125_tx_free(ring) / 2);
         descs = pool->tx_descs;
