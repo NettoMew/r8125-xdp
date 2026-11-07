@@ -59,6 +59,13 @@ with defect fixes and XDP / AF_XDP zero-copy support added on top.
   the `TxDesc` endianness ones, which the vendor layout also produces.
 - Kernel API differences go behind `LINUX_VERSION_CODE` checks. Verify the
   version against the actual headers of each kernel before writing one.
+- Vendor compat fallbacks guarded by `#ifndef name` silently replace kernel
+  functions that are not macros; that is how `dma_mapping_error()` became 0
+  (hazard E). Gate such fallbacks on the kernel version instead.
+- Run the test set on a kernel with `CONFIG_DMA_API_DEBUG`, `PROVE_LOCKING`
+  and `KFENCE`: the DMA API error count must not grow, `debug_locks` must stay
+  1 and the log must stay free of WARNING, BUG, lockdep and KFENCE reports.
+  `nm -u r8125.ko` should list `debug_dma_mapping_error`.
 
 ## Testing
 
@@ -69,6 +76,10 @@ with defect fixes and XDP / AF_XDP zero-copy support added on top.
   IPv4 frames to the IP length and re-pad them.
 - **Data integrity:** check end to end with a known byte pattern, not only
   with packet counts.
+- **Truncated frames after close/open:** after an interface close and open, the
+  hardware may deliver one frame cut to 60 bytes with no error bit. The
+  unmodified vendor driver does it too. Tell it apart from data corruption
+  before blaming the driver.
 - **Memory leaks:** check by comparing `nr_free_pages` across rounds, after
   `drop_caches`.
 - **Trigger paths:** to exercise the reset or ESD path, use a local test-only

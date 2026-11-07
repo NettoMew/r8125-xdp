@@ -96,6 +96,10 @@ xdp-loader load -m native -n xdp_tx enp1s0 r8125_test.bpf.o
 | V3 描述符（`ENABLE_PTP_SUPPORT=y` 时启用，32 字节，写回时地址字段被覆盖） | TCP 流量中触发 5 次 reset 和 3 次 ESD 恢复（只在测试版本里加的触发器），17.0 GiB 正确；空闲时各 5 次和 3 次，空闲页不变；XDP_TX、`ndo_xdp_xmit`、零拷贝 RX/TX 全部通过；零拷贝 l2fwd 期间并发 3 次 reset 和 2 次 ESD，191 万帧无错 |
 | 发送速率（60 / 1514 字节） | 零拷贝 41 万 / 20.3 万 pps，拷贝 34 万 / 20.3 万 pps；1514 字节就是 2.5G 线速 |
 
+**调试内核**（Armbian 镜像重新打包，内核开 DMA_API_DEBUG、PROVE_LOCKING、DEBUG_ATOMIC_SLEEP、KFENCE）下又跑了一遍：TCP 流量中挂/卸程序、重新协商、改 MTU；XDP_TX / redirect / drop；零拷贝 RX、各种 l2fwd 组合、拷贝模式、各长度 TX；零拷贝运行中重新协商、改 MTU（1800 被拒绝）、改环大小。全部结束后，DMA API 错误计数没有增加，`debug_locks` 仍为 1，内核日志里没有 WARNING / BUG / lockdep / KFENCE 报告。调试内核让 CPU 变慢，XDP_TX 时会有 `rx_missed`，所有收到的帧都正确发回。缺陷 E（DMA 映射错误检查被兼容宏编译掉）就是在这个内核上发现的。
+
+**已知的硬件 / 官方行为：close / open 之后的截断帧。** 接口 close 再 open（`ip link set down/up`、`ethtool -G`）之后，偶尔会收到一个被截成 60 字节、描述符里没有任何错误位的帧（帧头完整，IP 长度大于实际长度）。8 次 close / open 大约出现 2~5 个；重新协商（`ethtool -r`）在 1600 万帧里一次也没有出现。用只计数的 XDP 程序以 generic 模式挂在**未修改的官方驱动**上，同样每 8 次出现 2~5 个，所以这不是本驱动引入的。协议栈会按 IP 长度丢掉这种帧（`IpInTruncatedPkts`）；XDP 程序和 AF_XDP 应用应当像对待任何外来数据一样校验长度。
+
 A7Z 上 60 字节帧的发送上限约 39 万~41 万 pps，与零拷贝还是拷贝、定时器中断开或关都无关，此时 CPU 有 96% 空闲，瓶颈在这块板子的 PCIe Gen2 x1 链路对小帧的处理。x86 上的小帧上限需要另外测。
 
 ## 7. 尚未覆盖
@@ -103,5 +107,5 @@ A7Z 上 60 字节帧的发送上限约 39 万~41 万 pps，与零拷贝还是拷
 - x86 平台上机（只做了编译）
 - 开 RSS 后的多队列（V4 描述符、多队列零拷贝）：A7Z 只有一个中断向量，驱动会自动关闭 RSS。V3 描述符已经通过开启 PTP 覆盖
 - 8125A、8125D 等其他芯片的短帧填充行为（设计文档 §11 R9）
-- 长时间压力（`CONFIG_DMA_API_DEBUG`、KASAN）
+- KASAN：手动引导的 KASAN 内核没有起来，原因没有查明，这次改用 KFENCE；也还没有做过数小时级别的长跑
 - 小帧 RX 的上限：对端发包速率不够，测不出来

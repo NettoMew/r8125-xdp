@@ -167,6 +167,13 @@ static void rtl8125_reset_rings(struct net_device *dev)
 - **复现：** 让每隔一个描述符走一次丢包路径，修复前每 1 万次丢包空闲页减少约 5000 页，修复后不变。
 - **修复：** 丢包改走新的 `rtl8125_recycle_rx_buffer()`，把同一个 buffer 原样交给 `dirty_rx` 处的槽位，和正常路径一样维持不变量。XDP_DROP 也走它。
 
+### 隐患 E：兼容宏把全部 DMA 映射错误检查编译掉了（调试内核发现）
+
+- **位置：** `r8125.h` 的 `#ifndef dma_mapping_error / #define dma_mapping_error(a,b) 0`。
+- **原因：** 2.6.27 起 `dma_mapping_error()` 是函数而不是宏，`#ifndef` 恒为真，于是驱动里每一处映射检查都变成常量 0：RX 页分配、协议栈发送、XDP 发送。映射失败（IOMMU 或 swiotlb 耗尽）时，`DMA_MAPPING_ERROR` 会被当作地址交给硬件。
+- **发现：** 开 `CONFIG_DMA_API_DEBUG` 的内核上，模块只引用了 `debug_dma_map_single` 而没有 `debug_dma_mapping_error`，每次 unmap 都报 "failed to check map error"。
+- **修复：** 兼容宏只在 2.6.27 之前生效。修复后全套测试不再产生任何 DMA API 错误；未修改的官方驱动仍然会在每次 unmap 时报告。
+
 ---
 
 ## 4. 内核兼容策略（6.6+）
@@ -607,10 +614,12 @@ ISR v1 / v3 / v4 下 RX 和 TX 是同一个 NAPI，`kick` 两次时第二次会�
 | 12 | AF_XDP 零拷贝 RX | 新功能 | 校验和、PASS 混合流量、生命周期 |
 | 13 | AF_XDP 零拷贝 TX，声明 `XSK_ZEROCOPY` | 新功能 | l2fwd、各长度 TX、发送速率 |
 | — | `tools/xdp/` 测试程序，`docs/XDP.md` | — | — |
+| 14 | XDP 的 TX 加锁改为无条件加锁、调用方持锁检查 carrier（sparse 干净） | 不变 | 调试内核全套 |
+| 15 | 隐患 E：兼容宏不再覆盖 `dma_mapping_error()` | 修 bug | DMA_API_DEBUG 下错误计数为 0 |
 
 后续可选：XDP RX hash 元数据、多缓冲 / jumbo、page_pool（转发场景下页复用失败率高时再做，见 XDP.md）、ethtool coalesce + DIM、开 RSS 后的多队列零拷贝。
 
-Realtek 发新版时：更新 `vendor` 分支，`git rebase`。补丁 1~3 和 5 可以单独整理后反馈给 Realtek（nicfae@realtek.com）。
+Realtek 发新版时：更新 `vendor` 分支，`git rebase`。补丁 1~3、5 和 15 可以单独整理后反馈给 Realtek（nicfae@realtek.com）。
 
 ---
 
