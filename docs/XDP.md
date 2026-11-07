@@ -1,6 +1,8 @@
 # r8125 的 XDP 与 AF_XDP
 
-配套文档：[AF_XDP_ZC_DESIGN.md](AF_XDP_ZC_DESIGN.md)（设计与依据）
+配套文档：[AF_XDP_ZC_DESIGN.md](AF_XDP_ZC_DESIGN.md)（设计与依据）、[../CHANGELOG.md](../CHANGELOG.md)（逐项改动）
+
+适用版本：**9.018.00-xdp.1**（基于 Realtek r8125 9.018.00）
 
 本驱动在 Realtek 官方 r8125-9.018.00 的基础上增加了原生 XDP 和 AF_XDP 零拷贝。新逻辑集中在 `src/r8125_xdp.c` 和 `src/r8125_xdp.h`；`r8125_n.c` 里只有单行调用点，关掉开关时全部是空函数，行为和官方驱动一致。
 
