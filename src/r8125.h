@@ -442,7 +442,11 @@ do { \
 #define PCI_VENDOR_ID_DLINK 0x1186
 #endif
 
-#ifndef dma_mapping_error
+/*
+ * dma_mapping_error() is a function, not a macro, from 2.6.27 on; an #ifndef
+ * alone would replace it with 0 there and compile every mapping check out.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,27) && !defined(dma_mapping_error)
 #define dma_mapping_error(a,b) 0
 #endif
 
