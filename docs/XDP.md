@@ -98,7 +98,9 @@ xdp-loader load -m native -n xdp_tx enp1s0 r8125_test.bpf.o
 
 **调试内核**（Armbian 镜像重新打包，内核开 DMA_API_DEBUG、PROVE_LOCKING、DEBUG_ATOMIC_SLEEP、KFENCE）下又跑了一遍：TCP 流量中挂/卸程序、重新协商、改 MTU；XDP_TX / redirect / drop；零拷贝 RX、各种 l2fwd 组合、拷贝模式、各长度 TX；零拷贝运行中重新协商、改 MTU（1800 被拒绝）、改环大小。全部结束后，DMA API 错误计数没有增加，`debug_locks` 仍为 1，内核日志里没有 WARNING / BUG / lockdep / KFENCE 报告。调试内核让 CPU 变慢，XDP_TX 时会有 `rx_missed`，所有收到的帧都正确发回。缺陷 E（DMA 映射错误检查被兼容宏编译掉）就是在这个内核上发现的。
 
-**已知的硬件 / 官方行为：close / open 之后的截断帧。** 接口 close 再 open（`ip link set down/up`、`ethtool -G`）之后，偶尔会收到一个被截成 60 字节、描述符里没有任何错误位的帧（帧头完整，IP 长度大于实际长度）。8 次 close / open 大约出现 2~5 个；重新协商（`ethtool -r`）在 1600 万帧里一次也没有出现。用只计数的 XDP 程序以 generic 模式挂在**未修改的官方驱动**上，同样每 8 次出现 2~5 个，所以这不是本驱动引入的。协议栈会按 IP 长度丢掉这种帧（`IpInTruncatedPkts`）；XDP 程序和 AF_XDP 应用应当像对待任何外来数据一样校验长度。
+**KASAN 内核**（同一套镜像再开 KASAN generic，由 Armbian 构建流程打包；先前手工编译的 KASAN 内核启动不了，原因在手工构建，不在 KASAN）下把上面四轮又跑了一遍：TCP 流量中挂/卸程序、重新协商、改 MTU，6.6 GiB 正确；XDP_TX / redirect / drop；零拷贝和拷贝模式的全部组合与各长度 TX；零拷贝运行中重新协商、改 MTU、改环大小。KASAN、KFENCE、DMA API 和 WARNING 计数始终等于加载驱动之前的基线（基线里的一个 KASAN 报告和两个 WARNING 来自厂商内核启动时的其他驱动）。
+
+**已知的硬件 / 官方行为：close / open 之后的 64 字节描述符。** 接口 close 再 open（`ip link set down/up`、`ethtool -G`）之后，偶尔会有一个描述符报告收到 64 字节（去掉 FCS 是 60），没有任何错误位，但缓冲区并没有被这次写入：内容是缓冲区原来的数据。在 l2fwd 测试里，这一帧的 MAC 地址恰好是上一轮已经交换过的，由此可以确认。8 次 close / open 大约出现 2~5 个；重新协商（`ethtool -r`）在 1600 万帧里一次也没有出现。用只计数的 XDP 程序以 generic 模式挂在**未修改的官方驱动**上，同样每 8 次出现 2~5 个，所以这不是本驱动引入的。协议栈会按 IP 长度丢掉这种帧（`IpInTruncatedPkts`）；XDP 程序和 AF_XDP 应用应当像对待任何外来数据一样校验长度。
 
 A7Z 上 60 字节帧的发送上限约 39 万~41 万 pps，与零拷贝还是拷贝、定时器中断开或关都无关，此时 CPU 有 96% 空闲，瓶颈在这块板子的 PCIe Gen2 x1 链路对小帧的处理。x86 上的小帧上限需要另外测。
 
@@ -107,5 +109,5 @@ A7Z 上 60 字节帧的发送上限约 39 万~41 万 pps，与零拷贝还是拷
 - x86 平台上机（只做了编译）
 - 开 RSS 后的多队列（V4 描述符、多队列零拷贝）：A7Z 只有一个中断向量，驱动会自动关闭 RSS。V3 描述符已经通过开启 PTP 覆盖
 - 8125A、8125D 等其他芯片的短帧填充行为（设计文档 §11 R9）
-- KASAN：手动引导的 KASAN 内核没有起来，原因没有查明，这次改用 KFENCE；也还没有做过数小时级别的长跑
+- 数小时级别的长跑
 - 小帧 RX 的上限：对端发包速率不够，测不出来

@@ -63,12 +63,13 @@ AF_XDP 零拷贝照常以 `XDP_ZEROCOPY` 绑定，挂程序和建 socket 的先�
 - **编译**：x86 6.12；arm64 6.6、6.18、7.3。XDP 开和关两种配置，以及打开 RSS、PTP、多 TX 队列，都没有新增警告。`W=1` 和 sparse 下，XDP 代码只有与官方代码同源的描述符字节序提示。
 - **上机**：Radxa Cubie A7Z，RTL8125B，arm64，PCIe DMA 非一致，单中断向量。覆盖了 V1 和 V3 描述符、reset 和 ESD 恢复、XDP 全部判决、零拷贝收发及其生命周期，结果见 `docs/XDP.md`。
 - **调试内核**：在打开 DMA_API_DEBUG、lockdep、KFENCE、DEBUG_ATOMIC_SLEEP 的内核上跑了全套测试，驱动不再产生任何 DMA API 错误，lockdep 和 KFENCE 都没有报告。缺陷 E 就是这样发现的。
-- **已知的硬件 / 官方行为**：接口 close 再 open（`ip link set down/up`、`ethtool -G` 等）之后，偶尔会收到一个被截成 60 字节、却没有任何错误位的帧。官方原版驱动同样会出现。协议栈会按 IP 长度把它丢掉；XDP 程序和 AF_XDP 应用应当自行校验长度。
+- **KASAN**：同一套测试在 KASAN generic 内核上也跑完了，r8125 没有引起任何 KASAN、KFENCE、DMA API 或 WARNING 报告。
+- **已知的硬件 / 官方行为**：接口 close 再 open（`ip link set down/up`、`ethtool -G` 等）之后，偶尔会有一个描述符报告收到 60 字节、没有任何错误位，缓冲区里却是原有的旧数据。官方原版驱动同样会出现。协议栈会按 IP 长度把这种帧丢掉；XDP 程序和 AF_XDP 应用应当像对待任何外部输入一样校验长度和内容。
 - **尚未覆盖**：
   - x86 实机运行；
   - 开 RSS 后的多队列；
   - 8125A、8125D 等其他芯片；
-  - KASAN：手动引导的 KASAN 内核没有起来，原因没有查明，这次改用 KFENCE；也还没有做过数小时级别的长跑。
+  - 数小时级别的长跑。
 
 ## 许可证
 
