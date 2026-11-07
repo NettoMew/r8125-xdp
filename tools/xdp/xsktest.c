@@ -241,8 +241,17 @@ static void do_rx(struct stats *st)
                 const struct xdp_desc *d = xsk_ring_cons__rx_desc(&rx, idx_rx + i);
                 uint8_t *frame = xsk_umem__get_data(buffer, d->addr);
 
-                if (!frame_ok(frame, d->len))
-                        st->rx_bad++;
+                if (!frame_ok(frame, d->len)) {
+                        if (!st->rx_bad++) {
+                                unsigned int k;
+
+                                printf("  first bad frame: len %u addr 0x%llx:", d->len,
+                                       (unsigned long long)d->addr);
+                                for (k = 0; k < 64 && k < d->len; k++)
+                                        printf("%s%02x", k % 16 ? " " : "\n    ", frame[k]);
+                                printf("\n");
+                        }
+                }
 
                 if (cfg.mode == MODE_L2FWD) {
                         struct xdp_desc *t = xsk_ring_prod__tx_desc(&tx, idx_tx + i);
