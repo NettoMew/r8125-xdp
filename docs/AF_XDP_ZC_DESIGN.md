@@ -523,6 +523,15 @@ static void rtl8125_tx_release(tp, ring, entry, budget, &pkts, &bytes, &xsk_fram
   如果重建失败：打印错误，但仍然清空指针并返回 0。设备会停在 down 状态，和官方 change_mtu 失败时的语义一致
 ```
 
+**实现：** 两处重建失败都会用 `netdev_err` 打印出来，日志里带队列号和错误码，以前这两处的返回值都被直接丢掉。
+
+- 解绑时重建失败：返回值仍是 0。
+- 绑定失败后的回滚重建也失败：返回给调用方的仍是第一次绑定失败的错误码，不会被回滚的错误码覆盖。
+
+两种情况下都不会留下悬空的 pool 指针：`rtl8125_rings_rebuild()` 先调用 `set_pool` 清空指针，再执行 `init_ring`，所以重建失败时指针也已经清空，之后的 `xsk_pool_dma_unmap()` 是安全的。
+
+这套控制流有一个主机回归测试：`tools/xdp/test_xsk_pool_setup.py`，见 XDP.md §5。
+
 ### 7.6 挂/卸程序（`XDP_SETUP_PROG`）
 
 ```
@@ -616,6 +625,7 @@ ISR v1 / v3 / v4 下 RX 和 TX 是同一个 NAPI，`kick` 两次时第二次会�
 | — | `tools/xdp/` 测试程序，`docs/XDP.md` | — | — |
 | 14 | XDP 的 TX 加锁改为无条件加锁、调用方持锁检查 carrier（sparse 干净） | 不变 | 调试内核全套 |
 | 15 | 隐患 E：兼容宏不再覆盖 `dma_mapping_error()` | 修 bug | DMA_API_DEBUG 下错误计数为 0 |
+| 16 | XSK 解绑和回滚时，重建失败会打印错误（§7.5）；`xsktest` 核对实际协商到的模式；主机回归测试 | 只多了日志 | 未上机；主机回归 31 项通过，开 ASan / UBSan 也通过 |
 
 后续可选：XDP RX hash 元数据、多缓冲 / jumbo、page_pool（转发场景下页复用失败率高时再做，见 XDP.md）、ethtool coalesce + DIM、开 RSS 后的多队列零拷贝。
 

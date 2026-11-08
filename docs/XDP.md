@@ -64,7 +64,8 @@ AF_XDP 零拷贝照常用 `XDP_ZEROCOPY` 绑定。先挂程序还是先建 socke
 | 文件 | 作用 |
 |---|---|
 | `r8125_test.bpf.c` | `xdp_drop` / `xdp_tx` / `xdp_redirect` / `xdp_xsk` 四个程序，只处理发往 UDP 9、319、320 的 IPv4 帧，其余一律 PASS，所以 ARP、SSH 等不受影响 |
-| `xsktest.c` | AF_XDP 测试：`rx`（逐帧校验 IP 和 UDP 校验和）、`l2fwd`（交换 MAC 后发回）、`tx`（按指定长度和端口发 UDP），可选拷贝模式、关闭 need_wakeup、先建 socket 后挂程序 |
+| `xsktest.c` | AF_XDP 测试：`rx`（逐帧校验 IP 和 UDP 校验和）、`l2fwd`（交换 MAC 后发回）、`tx`（按指定长度和端口发 UDP），可选拷贝模式、关闭 need_wakeup、先建 socket 后挂程序。建好 socket 后用 `XDP_OPTIONS` 读出实际协商到的模式；和要求的模式不一致（比如要零拷贝却退回了拷贝模式），或者有坏帧、有未完成的发送时，退出码为 1 |
+| `test_xsk_pool_setup.py` | 主机回归测试，不需要网卡和 root 权限。从 `src/` 里抽出 `rtl8125_xsk_pool_setup()` 和 `rtl8125_rings_rebuild()`，把内核接口换成桩函数后编译运行，检查 pool 的归属、返回值和错误日志，共 31 项。`--revision <提交>` 可以拿旧版本对照。不能覆盖真实的 DMA、NAPI、内存分配失败和并发 |
 
 ```sh
 clang -O2 -g -target bpf -c tools/xdp/r8125_test.bpf.c -o r8125_test.bpf.o
@@ -74,6 +75,9 @@ xdp-loader load -m native -n xdp_tx enp1s0 r8125_test.bpf.o
 ./xsktest -i enp1s0 -m l2fwd -t 30            # 零拷贝，need_wakeup
 ./xsktest -i enp1s0 -m l2fwd -t 30 -c -w      # 拷贝模式，不用 need_wakeup
 ./xsktest -i enp1s0 -m tx -D <对端 MAC> -s <本端 IP> -d <对端 IP> -l 42 -p 319 -N 50000
+
+python3 tools/xdp/test_xsk_pool_setup.py                                   # 主机回归
+CFLAGS="-fsanitize=address,undefined -g" python3 tools/xdp/test_xsk_pool_setup.py
 ```
 
 **注意：** 测短帧填充时必须网线直连。有些交换机会按 IPv4 总长度截掉帧尾再补零，抓到的长度和填充都不可信（见设计文档 §10.1）。

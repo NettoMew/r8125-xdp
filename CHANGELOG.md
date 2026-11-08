@@ -1,5 +1,13 @@
 # 更新记录
 
+## 未发布
+
+- `r8125: XSK rebuild failures retain diagnostic context`
+  XSK 解绑或绑定回滚时，如果重建环失败，会打印带队列号和错误码的日志。返回值和 pool 的归属不变。回滚时返回的仍是原来的绑定错误。
+- `xsktest` 用 `XDP_OPTIONS` 读出实际协商到的模式，和要求的不一致就报错退出。出错时也会卸载程序、释放 UMEM。
+- 新增主机回归测试 `tools/xdp/test_xsk_pool_setup.py`（31 项），覆盖 XSK pool 设置和环重建的控制流。
+- 驱动改动只做了主机回归，还没有上机测试。
+
 ## 9.018.00-xdp.1
 
 基于 Realtek r8125 9.018.00 的第一个版本。
