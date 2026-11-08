@@ -3,7 +3,7 @@
 基于 Realtek 官方 Linux 驱动 **r8125-9.018.00**，在尽量少改动官方代码的前提下：
 
 - 增加了原生 XDP、`ndo_xdp_xmit` 和 AF_XDP 零拷贝收发；
-- 修复了官方驱动的五个缺陷。
+- 修复了官方驱动的六个缺陷。
 
 关掉 `ENABLE_XDP_SUPPORT` 时，除了缺陷修复，驱动行为和官方完全一致。
 
@@ -34,6 +34,7 @@
 | C | link down / ESD 重建 RX 环时没有停 NAPI | 与正在运行的 poll 并发释放页 | 读代码 |
 | D | 页复用模式下丢包会打破 `dirty_rx` 不变量 | 每次丢包后泄漏一页及其 DMA 映射，实测每万次丢包约 5000 页 | 实现 XDP_DROP 时发现，上机复现 |
 | E | 兼容宏 `#define dma_mapping_error(a,b) 0` 在 2.6.27 以后的内核上也生效 | 全部 DMA 映射错误检查被编译掉，映射失败时把 `DMA_MAPPING_ERROR` 当地址交给硬件 | DMA_API_DEBUG 内核 |
+| F | 重建环时，接收过滤在 RX 打开之前就已生效 | 带流量改 MTU、挂/卸 XDP 程序、reset 时，RX FIFO 溢出，网卡从此不再收包，直到 down 再 up | NanoPi R5S 上机发现，官方原版同样复现 |
 
 修复 C 时还顺带修正了官方的一处问题：`change_mtu` 重建失败后 NAPI 处于关闭状态，之后执行 close 会卡死。现在不会了。
 
@@ -72,6 +73,23 @@ sudo insmod src/r8125.ko
 - 没有打开 `ENABLE_RX_PACKET_FRAGMENT` / `ENABLE_LIB_SUPPORT`（默认都不打开）。
 
 如果要显式关闭，用 `make ... ENABLE_XDP_SUPPORT=n`。
+
+内核自带的 r8169 也认 RTL8125。udev 按 PCI alias 加载模块时会把两个都装上，并且不理会 modprobe.d 里的 `install` 和 `softdep` 规则，结果常常是 r8169 先抢到网口。可靠的做法是屏蔽 r8169，并更新 initramfs：
+
+```sh
+echo "blacklist r8169" | sudo tee /etc/modprobe.d/r8125.conf
+sudo update-initramfs -u
+```
+
+机器上如果还有只能由 r8169 驱动的网卡（例如 RTL8111），不要这样做，改为按设备绑定。
+
+开 RSS 多队列（需要多个 MSI-X 向量）：
+
+```sh
+make -C /lib/modules/$(uname -r)/build M=$PWD/src ENABLE_RSS_SUPPORT=y ENABLE_MULTIPLE_TX_QUEUE=y modules
+```
+
+RX 队列数等于内核默认的 RSS 队列数（4 核上是 2），驱动不支持用 `ethtool -L` 修改。
 
 确认 XDP 已编入：
 
@@ -124,7 +142,8 @@ gcc -O2 -Wall -o xsktest tools/xdp/xsktest.c -lxdp -lbpf
 | RTL8125A（CFG 2~3） | 代码路径与 8125B 相同（同样适用 PTP 勘误），未上机。需要确认硬件会自动补零短帧 |
 | RTL8125D 等不在 CFG 2~7 的芯片 | 不需要勘误填充，未上机。需要确认硬件会自动补零短帧 |
 | x86 | 编译通过（6.12），未上机 |
-| 多中断向量（ISR v2~v7）、开 RSS 的多队列 | 代码按官方中断布局实现，未上机。A7Z 只有一个中断向量，驱动会自动关闭 RSS |
+| RTL8125B，arm64，32 个 MSI-X 向量（ISR v2），NanoPi R5S | **RSS 多队列实测**：2 收 2 发；XDP_TX、redirect 和零拷贝收发在两个队列上都正常，两个 TX 环都在用；带流量挂/卸程序和改 MTU（隐患 F 修复后） |
+| 其他中断版本（ISR v3~v7） | 代码按官方中断布局实现，未上机 |
 
 在新芯片或新平台上验证的方法：在网线直连的对端抓包，用 `xsktest -m tx -l 42` 看线上是不是 60 字节、填充是不是全零；再跑一遍 `docs/XDP.md` 里的测试，大约半小时。
 
@@ -142,12 +161,13 @@ gcc -O2 -Wall -o xsktest tools/xdp/xsktest.c -lxdp -lbpf
 
 ## 测试概况
 
-在 Radxa Cubie A7Z（RTL8125B）上测试，对端是一台用网线直连的 Windows 主机（Intel I225-V）。
+在 Radxa Cubie A7Z（RTL8125B，单中断向量）和 NanoPi R5S（RTL8125B，多向量，RSS）上测试，对端是一台用网线直连的 Windows 主机（Intel I225-V）。
 
 - **编译**：x86 6.12；arm64 6.6、6.18、7.3。XDP 开和关两种配置、RSS / PTP / 多 TX 队列组合，都没有新增警告；`W=1` 和 sparse 下也干净。
 - **功能**：XDP 各判决；零拷贝和拷贝模式的全部组合；运行中重新协商链路、改 MTU、改环大小；V3 描述符下的 reset 和 ESD 恢复。
 - **调试内核**：DMA_API_DEBUG、lockdep、KFENCE、DEBUG_ATOMIC_SLEEP 下，r8125 没有引起任何报告。
 - **KASAN**：KASAN generic 内核下全套测试通过；两小时混合压测处理约 2.7 亿帧，没有任何报告，内存没有增长。
+- **RSS（R5S）**：8 条 TCP 流在两个 RX 队列上分布均匀，跑满 2.36 Gbit/s；带流量挂/卸程序和改 MTU 各 20 次；两个队列上的 XDP_TX、redirect、零拷贝 RX 和 l2fwd 收发计数一致，校验和全部正确。
 
 完整数据见 [`docs/XDP.md`](docs/XDP.md)。
 
@@ -161,7 +181,7 @@ gcc -O2 -Wall -o xsktest tools/xdp/xsktest.c -lxdp -lbpf
 | `vendor` | Realtek 9.018.00 原样导入，只用于将来 rebase 新版本 |
 | `exp/phase0` | 开发前的硬件实验（RX 对齐、短帧填充），不进补丁序列 |
 
-Realtek 发布新版本时：更新 `vendor` 分支，再把 `main` rebase 上去。缺陷 A~E 的修复提交可以单独整理后反馈给 Realtek。
+Realtek 发布新版本时：更新 `vendor` 分支，再把 `main` rebase 上去。缺陷 A~F 的修复提交可以单独整理后反馈给 Realtek。
 
 ## 文档
 

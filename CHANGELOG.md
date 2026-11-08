@@ -6,7 +6,10 @@
   XSK 解绑或绑定回滚时，如果重建环失败，会打印带队列号和错误码的日志。返回值和 pool 的归属不变。回滚时返回的仍是原来的绑定错误。
 - `xsktest` 用 `XDP_OPTIONS` 读出实际协商到的模式，和要求的不一致就报错退出。出错时也会卸载程序、释放 UMEM。
 - 新增主机回归测试 `tools/xdp/test_xsk_pool_setup.py`（31 项），覆盖 XSK pool 设置和环重建的控制流。
-- 驱动改动只做了主机回归，还没有上机测试。
+- **F** `r8125: accept frames only once the receiver is enabled`
+  重建环时，接收过滤要等 RX 打开之后才生效。以前带流量改 MTU、挂/卸 XDP 程序或 reset 时，RX FIFO 会溢出，网卡从此不再收包。在 NanoPi R5S 上发现，未修改的官方驱动同样能复现。
+- 首次在多向量平台上实测 RSS 多队列：在 NanoPi R5S 上测了 2 收 2 发，覆盖 XDP、redirect 和两个队列上的零拷贝。见 `docs/XDP.md` §6b。
+- README 补充了 r8169 抢占网口的处理（blacklist 并更新 initramfs），以及 RSS 的编译方法。
 
 ## 9.018.00-xdp.1
 

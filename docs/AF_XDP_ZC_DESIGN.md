@@ -174,6 +174,22 @@ static void rtl8125_reset_rings(struct net_device *dev)
 - **发现：** 开 `CONFIG_DMA_API_DEBUG` 的内核上，模块只引用了 `debug_dma_map_single` 而没有 `debug_dma_mapping_error`，每次 unmap 都报 "failed to check map error"。
 - **修复：** 兼容宏只在 2.6.27 之前生效。修复后全套测试不再产生任何 DMA API 错误；未修改的官方驱动仍然会在每次 unmap 时报告。
 
+### 隐患 F：带流量重建环时 RX FIFO 溢出，网卡从此不再收包（R5S 上机发现）
+
+- **位置：** `rtl8125_hw_config()` 末尾和 `rtl8125_hw_start()`。
+- **原因：** `hw_config` 结束前会打开 RX 门（`disable_rxdvgate`）并设好接收过滤，但 RX 要等到 `hw_start` 写 `ChipCmd = CmdRxEnb` 时才打开。重建路径上，两者之间还有 `link_on_patch` 的其余部分，其中包括好几次 MDIO 读 PHY 状态。这时链路是通的，帧会持续进入 FIFO，于是 FIFO 溢出：ISR 里出现 `RxFIFOOver`，ISR_V2 里对应 bit 22。之后芯片不再取描述符：
+  - 所有描述符的 OWN 位都还置着，`cur_rx` 不动；
+  - `rx_missed` 持续增长；
+  - 要等下一次在 FIFO 为空时复位才能恢复。比如空闲时再改一次 MTU，或者 down 再 up。
+
+  open 路径也有同样的窗口，但那时 PHY 刚复位、链路还没起来，没有帧进来。
+- **复现：** NanoPi R5S（RTL8125B，32 个 MSI-X 向量，ISR v2），8 条 TCP 流以 2.36 Gbit/s 流入。在这种负载下：
+  - 未修改的官方驱动第一次改 MTU 就停止收包，开不开 `ENABLE_RSS_SUPPORT` 都一样；
+  - `main` 第一次挂/卸程序或改 MTU 也是如此。
+
+  A7Z（单向量，ISR v1）上同样的测试没有出现过。
+- **修复：** `hw_config` 照常写入完整的 RxConfig，但把 accept 位全部清掉。`nic_reset` 等 FIFO 排空前也是这样做的，accept 位全清时帧不会进入 FIFO。`hw_start` 写完 `CmdRxEnb` 后，再设置接收过滤。主线 r8169 的顺序相同：`rtl_hw_start()` 先打开接收器，再调用 `rtl_set_rx_mode()`。修复后，在同样的负载下，默认配置和 RSS 配置各做了 20 次挂/卸程序、20 次改 MTU，全部正常。
+
 ---
 
 ## 4. 内核兼容策略（6.6+）
@@ -625,11 +641,12 @@ ISR v1 / v3 / v4 下 RX 和 TX 是同一个 NAPI，`kick` 两次时第二次会�
 | — | `tools/xdp/` 测试程序，`docs/XDP.md` | — | — |
 | 14 | XDP 的 TX 加锁改为无条件加锁、调用方持锁检查 carrier（sparse 干净） | 不变 | 调试内核全套 |
 | 15 | 隐患 E：兼容宏不再覆盖 `dma_mapping_error()` | 修 bug | DMA_API_DEBUG 下错误计数为 0 |
-| 16 | XSK 解绑和回滚时，重建失败会打印错误（§7.5）；`xsktest` 核对实际协商到的模式；主机回归测试 | 只多了日志 | 未上机；主机回归 31 项通过，开 ASan / UBSan 也通过 |
+| 16 | XSK 解绑和回滚时，重建失败会打印错误（§7.5）；`xsktest` 核对实际协商到的模式；主机回归测试 | 只多了日志 | 主机回归 31 项通过，开 ASan / UBSan 也通过；R5S 上零拷贝绑定和解绑正常 |
+| 17 | 隐患 F：RX 打开之后才设置接收过滤 | 修 bug | R5S：8 条 TCP 流满速下，挂/卸程序 20 次 + 改 MTU 20 次，默认配置和 RSS 配置都通过；修复前第一次就卡住 |
 
 后续可选：XDP RX hash 元数据、多缓冲 / jumbo、page_pool（转发场景下页复用失败率高时再做，见 XDP.md）、ethtool coalesce + DIM、开 RSS 后的多队列零拷贝。
 
-Realtek 发新版时：更新 `vendor` 分支，`git rebase`。补丁 1~3、5 和 15 可以单独整理后反馈给 Realtek（nicfae@realtek.com）。
+Realtek 发新版时：更新 `vendor` 分支，`git rebase`。补丁 1~3、5、15 和 17 可以单独整理后反馈给 Realtek（nicfae@realtek.com）。
 
 ---
 
