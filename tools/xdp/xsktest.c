@@ -324,7 +324,7 @@ static int attach_program(int ifindex, int *map_fd)
         return 0;
 }
 
-static void create_socket(void)
+static int create_socket(struct xdp_options *opts)
 {
         struct xsk_socket_config xcfg = {
                 .rx_size = RING_SIZE,
@@ -333,11 +333,34 @@ static void create_socket(void)
                 .bind_flags = (cfg.copy ? XDP_COPY : XDP_ZEROCOPY) |
                               (cfg.wakeup ? XDP_USE_NEED_WAKEUP : 0),
         };
+        socklen_t optlen = sizeof(*opts);
+        bool zerocopy;
         int err;
 
         err = xsk_socket__create(&xsk, cfg.ifname, cfg.queue, umem, &rx, &tx, &xcfg);
-        if (err)
-                die(cfg.copy ? "xsk_socket__create (copy mode)" : "xsk_socket__create (zero-copy)", err);
+        if (err) {
+                fprintf(stderr, "xsktest: xsk_socket__create (%s): %s\n",
+                        cfg.copy ? "copy" : "zero-copy", strerror(-err));
+                return -1;
+        }
+        if (getsockopt(xsk_socket__fd(xsk), SOL_XDP, XDP_OPTIONS,
+                       opts, &optlen)) {
+                fprintf(stderr, "xsktest: getsockopt(XDP_OPTIONS): %s\n", strerror(errno));
+                return -1;
+        }
+        if (optlen != sizeof(*opts)) {
+                fprintf(stderr, "xsktest: XDP_OPTIONS size %u, expected %zu\n",
+                        (unsigned int)optlen, sizeof(*opts));
+                return -1;
+        }
+        zerocopy = !!(opts->flags & XDP_OPTIONS_ZEROCOPY);
+        if (zerocopy != !cfg.copy) {
+                fprintf(stderr, "xsktest: requested %s, negotiated %s (XDP_OPTIONS flags 0x%x)\n",
+                        cfg.copy ? "copy" : "zero-copy", zerocopy ? "zero-copy" : "copy",
+                        opts->flags);
+                return -1;
+        }
+        return 0;
 }
 
 static void usage(void)
@@ -367,6 +390,9 @@ int main(int argc, char **argv)
                 .frame_headroom = 0,
         };
         struct stats st = { 0 }, last = { 0 };
+        struct xdp_options opts = { 0 };
+        bool attached = false;
+        int status = 1;
         double start, tick;
         uint8_t smac[ETH_ALEN] = { 0 };
         int opt, err, ifindex, map_fd;
@@ -438,11 +464,15 @@ int main(int argc, char **argv)
         }
 
         if (cfg.bind_first) {
-                create_socket();
+                if (create_socket(&opts))
+                        goto cleanup;
                 attach_program(ifindex, &map_fd);
+                attached = true;
         } else {
                 attach_program(ifindex, &map_fd);
-                create_socket();
+                attached = true;
+                if (create_socket(&opts))
+                        goto cleanup;
         }
         err = xsk_socket__update_xskmap(xsk, map_fd);
         if (err)
@@ -454,9 +484,10 @@ int main(int argc, char **argv)
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
         start = tick = now();
-        printf("%s queue %u, %s, %s, need_wakeup %s\n", cfg.ifname, cfg.queue,
+        printf("%s queue %u, %s, negotiated %s, XDP_OPTIONS flags 0x%x, need_wakeup %s\n", cfg.ifname, cfg.queue,
                cfg.mode == MODE_RX ? "rx" : cfg.mode == MODE_L2FWD ? "l2fwd" : "tx",
-               cfg.copy ? "copy" : "zero-copy", cfg.wakeup ? "on" : "off");
+               opts.flags & XDP_OPTIONS_ZEROCOPY ? "zero-copy" : "copy",
+               opts.flags, cfg.wakeup ? "on" : "off");
 
         while (!stop && now() - start < cfg.seconds) {
                 if (cfg.mode == MODE_TX) {
@@ -490,9 +521,14 @@ int main(int argc, char **argv)
         printf("total rx %lu, bad %lu, tx %lu, completed %lu\n", st.rx, st.rx_bad, st.tx,
                st.tx_done);
 
-        xsk_socket__delete(xsk);
+        status = st.rx_bad || st.tx_done < st.tx ? 1 : 0;
+cleanup:
+        if (xsk)
+                xsk_socket__delete(xsk);
         xsk_umem__delete(umem);
-        bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
+        if (attached)
+                bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
+        munmap(buffer, (size_t)NUM_FRAMES * FRAME_SIZE);
 
-        return st.rx_bad || st.tx_done < st.tx ? 1 : 0;
+        return status;
 }

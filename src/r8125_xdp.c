@@ -242,10 +242,14 @@ static int rtl8125_xsk_pool_setup(struct net_device *dev,
                 if (!pool)
                         return -EINVAL;
 
-                if (live)
-                        rtl8125_rings_rebuild(dev, rtl8125_xsk_set_pool, &b);
-                else
+                if (live) {
+                        err = rtl8125_rings_rebuild(dev, rtl8125_xsk_set_pool, &b);
+                        if (err)
+                                netdev_err(dev, "Failed to rebuild rings after XSK unbind on queue %u: %d\n",
+                                           qid, err);
+                } else {
                         rtl8125_xsk_set_pool(tp, &b);
+                }
 
                 xsk_pool_dma_unmap(pool, RTL8125_XSK_DMA_ATTRS);
                 return 0;
@@ -265,8 +269,13 @@ static int rtl8125_xsk_pool_setup(struct net_device *dev,
 
         err = rtl8125_rings_rebuild(dev, rtl8125_xsk_set_pool, &b);
         if (err) {
+                int rollback_err;
+
                 b.pool = NULL;
-                rtl8125_rings_rebuild(dev, rtl8125_xsk_set_pool, &b);
+                rollback_err = rtl8125_rings_rebuild(dev, rtl8125_xsk_set_pool, &b);
+                if (rollback_err)
+                        netdev_err(dev, "Failed to rebuild rings after XSK bind rollback on queue %u: %d\n",
+                                   qid, rollback_err);
                 xsk_pool_dma_unmap(pool, RTL8125_XSK_DMA_ATTRS);
                 return err;
         }
