@@ -19180,8 +19180,14 @@ rtl8125_hw_config(struct net_device *dev)
                 tp->pci_cfg_is_read = 1;
         }
 
-        /* Set Rx packet filter */
+        /*
+         * Program the receive configuration, but accept nothing until
+         * rtl8125_hw_start() has enabled the receiver: frames accepted
+         * before that overflow the RX FIFO, after which the chip stops
+         * fetching descriptors.
+         */
         rtl8125_hw_set_rx_packet_filter(dev);
+        rtl8125_disable_rx_packet_filter(tp);
 
 #ifdef ENABLE_DASH_SUPPORT
         rtl8125_check_and_enable_dash_interrupt(tp);
@@ -19206,6 +19212,8 @@ rtl8125_hw_start(struct net_device *dev)
 #endif
 
         RTL_W8(tp, ChipCmd, CmdTxEnb | CmdRxEnb);
+
+        rtl8125_hw_set_rx_packet_filter(dev);
 
         rtl8125_enable_hw_interrupt(tp);
 
